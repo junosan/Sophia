@@ -27,8 +27,8 @@ def main():
     options['input_dim']          = 44
     options['target_dim']         = 1
     options['unit_type']          = 'LSTM'
-    options['net_width']          = 1024
-    options['net_depth']          = 4
+    options['net_width']          = 256
+    options['net_depth']          = 2
     options['batch_size']         = 64
     options['step_size']          = 128
     options['rolling_first_step'] = True
@@ -112,7 +112,8 @@ def main():
                                  step_size       = options['step_size'],
                                  first_step_hint = batch_idx if options['rolling_first_step'] \
                                                    else 0):
-                losses.append(f_propagate(input_step_tbi, target_step_tbi, time_t))
+                loss = f_propagate(input_step_tbi, target_step_tbi, time_t)
+                losses.append(np.asscalar(loss[0])) 
                 frame = input_step_tbi.shape[0] * input_step_tbi.shape[1]
                 frames.append(frame)
                 frames_seen += frame

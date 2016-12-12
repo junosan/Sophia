@@ -105,9 +105,7 @@ loosely correlated target.
 
 ## TODO
 
-- rolling_first_step (1~h)
 - Ensemble
-- implement learnable clocks - turn on/off with an option?
 - test pybind11 (are Python states kept between calls from C++ code)
     if not, use zeroMQ
 
@@ -117,6 +115,6 @@ loosely correlated target.
 * [SliceableOrderedDict](http://stackoverflow.com/questions/30975339/slicing-a-python-ordereddict)
 
 # Acknowledgements
-Used partial code from:
-- Layer normalization implementation: https://github.com/ryankiros/layer-norm (license not specified)
-- Weight initializers: https://github.com/ivendrov/order-embedding (Apache License 2.0)
+Consulted code from
+- Layer normalization: https://github.com/ryankiros/layer-norm (license not specified)
+- Learning rate annealing: https://github.com/KyuyeonHwang/Fractal (Apache-2.0 license)

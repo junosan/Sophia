@@ -230,6 +230,7 @@ class Net():
         As a side effect, calling it updates
             _v_prev_states <- _prev_state_updates (has _port_i_input_tbi &
                                                        _port_i_time_t as undetermined input)
+        Note that output is a list of np.ndarray (even if 1 output & scalar)
         """
         if self._is_training:
             return th.function(inputs  = [self._port_i_input_tbi, self._port_i_target_tbi,
@@ -253,6 +254,7 @@ class Net():
             _v_grads       <- _grad_updates       (has _port_i_input_tbi, _port_i_target_tbi, and
                                                        _port_i_time_t as undetermined input)
             _v_prev_states <- _prev_state_updates (has _port_i_input_tbi as undetermined input)
+        Note that output is a list of np.ndarray (even if 1 output & scalar)
         """
         assert self._is_training
         return th.function(inputs  = [self._port_i_input_tbi, self._port_i_target_tbi,
