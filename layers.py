@@ -166,8 +166,9 @@ class LSTMLayer(Layer):
             thru = lambda x_bi: x_bi
             f = [thru] * 3
         else:
-            f = [(lambda x_bi: self.layer_norm(x_bi, v_param('s' + str(i)), v_param('b' + str(i)))) \
-                 for i in range(3)]
+            f = [(lambda x_bi, i = i: \
+                      self.layer_norm(x_bi, v_param('s' + str(i)), v_param('b' + str(i)))) \
+                 for i in range(3)] # i = i part needed due to Python 2.7's limitations
             non_seqs.extend(map(v_param, 's0 s1 s2 b0 b1 b2'.split()))
 
         # options['learn_clock_params']
@@ -247,7 +248,7 @@ class GRULayer(Layer):
             params[self.pfx('b2')] = np.zeros(1 * n_out).astype('float32')
             params[self.pfx('b3')] = np.zeros(1 * n_out).astype('float32')
 
-        if options('learn_clock_params'):
+        if options['learn_clock_params']:
             self.add_clock_params(params, n_out, options)
 
     def add_v_prev_state(self, v_prev_states):
@@ -274,8 +275,9 @@ class GRULayer(Layer):
             thru = lambda x_bi: x_bi
             f = [thru] * 4
         else:
-            f = [(lambda x_bi: self.layer_norm(x_bi, v_param('s' + str(i)), v_param('b' + str(i)))) \
-                 for i in range(4)]
+            f = [(lambda x_bi, i = i: \
+                      self.layer_norm(x_bi, v_param('s' + str(i)), v_param('b' + str(i)))) \
+                 for i in range(4)] # i = i part needed due to Python 2.7's limitations
             non_seqs.extend(map(v_param, 's0 s1 s2 s3 b0 b1 b2 b3'.split()))
 
         # options['learn_clock_params']

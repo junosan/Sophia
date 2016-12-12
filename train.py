@@ -27,24 +27,24 @@ def main():
     options['input_dim']          = 44
     options['target_dim']         = 1
     options['unit_type']          = 'LSTM'
-    options['net_width']          = 256
-    options['net_depth']          = 2
+    options['net_width']          = 1024
+    options['net_depth']          = 4
     options['batch_size']         = 64
     options['step_size']          = 128
     options['rolling_first_step'] = True
     options['learn_init_states']  = False
     options['layer_norm']         = False
     options['learn_clock_params'] = False
-    options['clock_t_exp_lo']     = 1.
-    options['clock_t_exp_hi']     = 7.
-    options['clock_r_on']         = 0.1
-    options['clock_leak_rate']    = 0.001
+    # options['clock_t_exp_lo']     = 1.
+    # options['clock_t_exp_hi']     = 6.
+    # options['clock_r_on']         = 0.2
+    # options['clock_leak_rate']    = 0.001
     options['grad_clip']          = 2.
     options['optimizer']          = 'adam'
     options['lr_init_val']        = 0.001
-    options['lr_lower_bound']     = 0.001
+    options['lr_lower_bound']     = 0.00001
     options['lr_decay_rate']      = 0.5
-    options['max_retry']          = 2
+    options['max_retry']          = 10
     options['frames_per_epoch']   = 8 * 1024 * 1024
 
 

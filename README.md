@@ -20,17 +20,17 @@ loosely correlated target.
 - batch_size            : 64
 - step_size             : 128
 - rolling_first_step    : True
-- learn_init_states     : False
+- learn_init_states     : False (currently not working)
 - layer_norm            : False ([arXiv:1607.06450](https://arxiv.org/abs/1607.06450))
 - learn_clock_params    : False ([arXiv:1610.09513](https://arxiv.org/abs/1610.09513))
 - clock_t_exp_lo        : 1
-- clock_t_exp_hi        : 7
-- clock_r_on            : 0.1
+- clock_t_exp_hi        : 6
+- clock_r_on            : 0.2
 - clock_leak_rate       : 0.001
 - optimizer             : 'adam'
 - grad_clip             : 2.
 - lr_init_val           : 0.001
-- lr_lower_bound        : 0.0001
+- lr_lower_bound        : 0.00001
 - lr_decay_rate         : 0.5
 - max_retry             : 10
 - frames_per_epoch      : 8 * 1024 * 1024
@@ -104,14 +104,12 @@ loosely correlated target.
 
 
 ## TODO
-
 - Ensemble
 - test pybind11 (are Python states kept between calls from C++ code)
     if not, use zeroMQ
 
 
 ## Miscellaneous notes
-* About launching multiple processes: https://groups.google.com/forum/#!topic/theano-dev/jzB08629Vvw
 * [SliceableOrderedDict](http://stackoverflow.com/questions/30975339/slicing-a-python-ordereddict)
 
 # Acknowledgements

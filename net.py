@@ -14,7 +14,7 @@ import cPickle as pk
 from collections import OrderedDict
 import os
 
-from layers import FCLayer, LSTMLayer
+from layers import FCLayer, LSTMLayer, GRULayer
 from utils import MSE_loss, clip_norm, get_random_string
 from optimizers import adam
 
