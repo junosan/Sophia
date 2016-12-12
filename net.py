@@ -99,13 +99,24 @@ class Net():
         Declare and store shared variables for parameters, gradients, and prev_states
         """
         self._v_params = OrderedDict()
+        self._v_params_wo_init  = OrderedDict()
         for k, v in self._params.iteritems():
             self._v_params[k] = th.shared(v, name = k)
-        if self._is_training:
-            self._v_grads = [th.shared(v * 0, name = k + '_grad') for k, v in self._params.iteritems()]
-        self._v_prev_states = {}
+            if k[-4:] != 'init':
+                self._v_params_wo_init[k] = self._v_params[k]                
+        self._v_prev_states = OrderedDict()
         for layer in self._layers:
             layer.add_v_prev_state(self._v_prev_states)
+        if self._is_training:
+            self._v_grads = [th.shared(v.get_value() * 0., name = k + '_grad') \
+                             for k, v in self._v_params_wo_init.iteritems()]
+            if self._options['learn_init_states']:
+                self._v_params_for_init  = OrderedDict()
+                for k, v in self._v_params.iteritems():
+                    if k[-4:] == 'init':
+                        self._v_params_for_init[k] = v
+                self._v_grads_for_init = [th.shared(v.get_value() * 0., name = k + '_grad') \
+                                          for k, v in self._v_prev_states.iteritems()]
 
     def _setup_forward_graph(self, s_input_tbi, s_time_t, v_params, v_prev_states):
         """
@@ -150,13 +161,13 @@ class Net():
         """
         return MSE_loss(s_output_tbi, s_target_tbi)
 
-    def _setup_grad_updates_graph(self, s_loss, v_params, v_grads):
+    def _setup_grad_updates_graph(self, s_loss, v_wrt, v_grads):
         """
         Connect loss to new values of gradients
             grad_update = (v_grad, s_new_grad)
         Takes inputs as lists instead of OrderedDict
         """
-        s_grads = tt.grad(s_loss, wrt = v_params) # OrderedDict -> list
+        s_grads = tt.grad(s_loss, wrt = v_wrt) # OrderedDict -> list
         if self._options['grad_clip'] > 0.:
             s_grads = [clip_norm(s_grad, self._options['grad_clip']) for s_grad in s_grads]
         return zip(v_grads, s_grads)
@@ -196,13 +207,27 @@ class Net():
                                                    s_target_tbi = self._port_i_target_tbi)
 
         self._grad_updates  = self._setup_grad_updates_graph (s_loss   = self._port_o_loss,
-                                                              v_params = self._v_params.values(),
+                                                              v_wrt    = self._v_params_wo_init.values(),
                                                               v_grads  = self._v_grads)
         self._optim_state_inits, \
         self._param_updates = self._setup_param_updates_graph(s_lr     = self._port_i_lr,
-                                                              v_params = self._v_params.values(),
+                                                              v_params = self._v_params_wo_init.values(),
                                                               v_grads  = self._v_grads)
-
+        
+        if self._options['learn_init_states']:
+            self._grad_updates_for_init = self._setup_grad_updates_graph\
+                                                             (s_loss   = self._port_o_loss,
+                                                              v_wrt    = self._v_prev_states.values(),
+                                                              v_grads  = self._v_grads_for_init)
+            
+            s_grads_for_init_flattened = [tt.mean(v, axis = 0) for v in self._v_grads_for_init]
+            optim_state_inits_for_init, \
+            self._param_updates_for_init = self._setup_param_updates_graph\
+                                                             (s_lr     = self._port_i_lr,
+                                                              v_params = self._v_params_for_init.values(),
+                                                              v_grads  = s_grads_for_init_flattened)
+            self._optim_state_inits.extend(optim_state_inits_for_init)
+        
     def compile_f_initialize_states(self):
         """
         Compile a callable object of signature
@@ -217,7 +242,8 @@ class Net():
             updates = [(v, tt.zeros_like(v)) for v in self._v_prev_states.itervalues()]
         else:
             to_init = lambda k: k[:-4] + 'init'
-            updates = [(v, self._v_params[to_init(k)]) for k, v in self._v_prev_states.iteritems()]
+            updates = [(v, tt.tile(self._v_params[to_init(k)], (self._options['batch_size'], 1))) \
+                       for k, v in self._v_prev_states.iteritems()]
         return th.function(inputs  = [],
                            outputs = [],
                            updates = updates)
@@ -278,12 +304,37 @@ class Net():
                            outputs = [],
                            updates = self._param_updates)
     
+    def compile_f_fwd_bwd_for_init(self):
+        """
+        NOTE: For the first time step during options['learn_init_states'],
+              call f_ returned by this *instead of* that by compile_f_fwd_bwd_propagate
+        """
+        assert self._is_training and self._options['learn_init_states']
+        return th.function(inputs  = [self._port_i_input_tbi, self._port_i_target_tbi,
+                                      self._port_i_time_t],
+                           outputs = [self._port_o_loss],
+                           updates = self._grad_updates + self._prev_state_updates + \
+                                     self._grad_updates_for_init,
+                           on_unused_input = 'raise' if self._options['learn_clock_params'] \
+                                        else 'ignore')
+    
+    def compile_f_update_init_states(self):
+        """
+        NOTE: For the first time step during options['learn_init_states'],
+              call f_ returned by this *in addition to* that by compile_f_update_v_params
+        """
+        assert self._is_training and self._options['learn_init_states']
+        return th.function(inputs  = [self._port_i_lr],
+                           outputs = [],
+                           updates = self._param_updates_for_init)
+
     def compile_f_initialize_optimizer(self):
         """
         Compile a callable object of signature
             f() -> None
         As a side effect, calling it updates
             v_optim_states <- s_init_optim_states (these are stored indirectly in this class)
+        Call f_ returned by this when learning rate has changed
         """
         assert self._is_training
         return th.function(inputs  = [],

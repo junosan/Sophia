@@ -79,13 +79,17 @@ def main():
     print('Compiling fwd/bwd propagators... ', end = ' ')
     start = time.time()
     f_fwd_bwd_propagate = net.compile_f_fwd_bwd_propagate()
-    f_fwd_propagate     = net.compile_f_fwd_propagate()
+    if options['learn_init_states']:
+        f_fwd_bwd_for_init = net.compile_f_fwd_bwd_for_init()
+    f_fwd_propagate = net.compile_f_fwd_propagate()
     print(lapse_from(start))
 
     print('Compiling updater/initializers...', end = ' ')
     start = time.time()
-    f_update_v_params      = net.compile_f_update_v_params()
-    f_initialize_states    = net.compile_f_initialize_states()
+    f_update_v_params = net.compile_f_update_v_params()
+    if options['learn_init_states']:
+        f_update_init_states = net.compile_f_update_init_states()
+    f_initialize_states = net.compile_f_initialize_states()
     f_initialize_optimizer = net.compile_f_initialize_optimizer()
     print(lapse_from(start))
 
@@ -98,8 +102,7 @@ def main():
                                target_dim = options['target_dim'],
                                batch_size = options['batch_size'])
     
-    def run_epoch(bool_train, data_iter, lr, frames_per_epoch, options, 
-                  f_initialize_states, f_propagate, f_update_v_params):
+    def run_epoch(bool_train, data_iter, lr_cur):
         losses = []
         frames = []
         frames_seen = 0
@@ -112,14 +115,22 @@ def main():
                                  step_size       = options['step_size'],
                                  first_step_hint = batch_idx if options['rolling_first_step'] \
                                                    else 0):
-                loss = f_propagate(input_step_tbi, target_step_tbi, time_t)
+                if bool_train:
+                    if options['learn_init_states'] and time_t[0] == 0:
+                        loss = f_fwd_bwd_for_init(input_step_tbi, target_step_tbi, time_t)
+                    else:
+                        loss = f_fwd_bwd_propagate(input_step_tbi, target_step_tbi, time_t)
+                else:
+                    loss = f_fwd_propagate(input_step_tbi, target_step_tbi, time_t)
                 losses.append(np.asscalar(loss[0])) 
                 frame = input_step_tbi.shape[0] * input_step_tbi.shape[1]
                 frames.append(frame)
                 frames_seen += frame
                 if bool_train:
-                    f_update_v_params(lr)
-                if frames_seen >= frames_per_epoch:
+                    f_update_v_params(lr_cur)
+                    if options['learn_init_states'] and time_t[0] == 0:
+                        f_update_init_states(lr_cur)
+                if frames_seen >= options['frames_per_epoch']:
                     finished = True
                     break
             if finished:
@@ -155,8 +166,7 @@ def main():
         print('----------------------------------------------------------------------')
         print('Training...  ', end = ' ')
         start = time.time()
-        _, trained_frames = run_epoch(True, train_data, lr, options['frames_per_epoch'], options,
-                                      f_initialize_states, f_fwd_bwd_propagate, f_update_v_params)
+        _, trained_frames = run_epoch(True, train_data, lr)
         print(lapse_from(start))
 
         total_trained_frames += trained_frames
@@ -166,8 +176,7 @@ def main():
 
         print('Evaluating...', end = ' ')
         start = time.time()
-        loss_cur, _ = run_epoch(False, dev_data, None, options['frames_per_epoch'], options,
-                                f_initialize_states, f_fwd_propagate, None)
+        loss_cur, _ = run_epoch(False, dev_data, None)
         print(lapse_from(start))
 
         print('Total  trained  frames: ' + str(total_trained_frames  ).rjust(12))
@@ -242,12 +251,10 @@ def main():
 
     print('Best network:')
     print('Train set')
-    loss_train, _ = run_epoch(False, train_data, None, options['frames_per_epoch'], options,
-                              f_initialize_states, f_fwd_propagate, None)
+    loss_train, _ = run_epoch(False, train_data, None)
     print('    Loss: ' + str(loss_train))
     print('Dev set')
-    loss_dev, _   = run_epoch(False, dev_data, None, options['frames_per_epoch'], options,
-                              f_initialize_states, f_fwd_propagate, None)
+    loss_dev, _   = run_epoch(False, dev_data, None)
     print('    Loss: ' + str(loss_dev))
 
 if __name__ == '__main__':

@@ -44,6 +44,8 @@ class Layer():
         Implements:
             Add this layer's v_prev_state to v_prev_states (recurrent layers only)
             v_prev_state should have the same dimensions as step function's output
+            If there are multiple, they must be added in exactly the same order
+            as in add_param
         Inputs:
            &v_prev_states   dict    { str : th.SharedVariable }
         Returns:

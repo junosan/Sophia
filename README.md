@@ -20,7 +20,7 @@ loosely correlated target.
 - batch_size            : 64
 - step_size             : 128
 - rolling_first_step    : True
-- learn_init_states     : False (currently not working)
+- learn_init_states     : False
 - layer_norm            : False ([arXiv:1607.06450](https://arxiv.org/abs/1607.06450))
 - learn_clock_params    : False ([arXiv:1610.09513](https://arxiv.org/abs/1610.09513))
 - clock_t_exp_lo        : 1
@@ -54,10 +54,11 @@ loosely correlated target.
 <br>
 
 
-|         suffix          |           explanation          |        
-|:-----------------------:|:------------------------------:|
-|<tensor_name>_[t][b][i/j]|[time][batch][hidden] dimensions|
-|   <individual_name>s    |collections (list, dict, etc)   |
+|         suffix          |              explanation              |        
+|:-----------------------:|:-------------------------------------:|
+|<tensor_name>_[t][b][i/j]|[time][batch][hidden] dimensions       |
+|   <individual_name>s    |collections (list, dict, etc)          |
+|   <any_name>_for_init   |related to options['learn_init_states']|
 
 ` [optional], <required>, {default}, (miscellaneous) `
 
@@ -72,7 +73,7 @@ loosely correlated target.
 |   _params    |OrderedDict|   str : np.ndarray    |learnable parameters (on CPU memory)             <br> used for initialization or as a buffer   |
 |  _v_params   |OrderedDict|str : th.SharedVariable|learnable parameters (on GPU memory)                                                           |
 |   _v_grads   |    list   |   th.SharedVariable   |loss gradients wrt above; same order as above                                                  |
-|_v_prev_states|    dict   |str : th.SharedVariable|state values right before this time step         <br> clock and layers own one state each      |
+|_v_prev_states|OrderedDict|str : th.SharedVariable|state values right before this time step         <br> clock and layers own one state each      |
 |  _*_updates  |    list   |       (v_$, s_$)      |give this to th.function to make a function that <br> actually performs the updates when called|
 
 <br>
