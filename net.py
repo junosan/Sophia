@@ -5,11 +5,10 @@
 #==========================================================================#
 
 """
-Class for setting up graphs and compiling updator functions
+Class for setting up graphs and compiling updater functions
 See README.md for a summary of this class
 """
 
-from subprocess import call
 import cPickle as pk
 from collections import OrderedDict
 import os
@@ -25,14 +24,16 @@ import theano.tensor as tt
 class Net():
     def __init__(self, options = None, save_to = None, load_from = None):
         """
+        Mode is determined by whether save_to is None or not
         Training:
-            <options>   OrderedDict { 'option_name' : option_val }
+            <options>   OrderedDict { 'option_name' : option_val     }
             <save_to>   str         'path'
             [load_from] str         'path' (set for re-annealing)
         Inference:
-            (options)   NoneType    (leave as none)
+            [options]   OrderedDict { 'batch_size'  : new_batch_size }
             (save_to)   NoneType    (leave as none)
             <load_from> str         'path'
+            For inference, only options['batch_size'] is applicable 
         """
         self._configure(options, save_to, load_from)    
         self._init_params(load_from)
@@ -43,27 +44,28 @@ class Net():
             self._setup_inference_graph()
     
     def _configure(self, options, save_to, load_from):
-        if options is not None:
+        if save_to is not None:
             self._is_training = True
+            assert options is not None
             self._options = options
-            assert save_to is not None
-            assert 0 == call(str('mkdir -p ' + save_to).split())
             self._save_to = save_to
             self._pfx = ''
             if load_from is not None:
-                print 'Reloading model from ' + load_from
                 with open(load_from + '/options.pkl', 'rb') as f:
                     loaded_options = pk.load(f)
-                    assert self._options == loaded_options
+                    if self._options != loaded_options:
+                        print '[Error] Mismatching options in loaded model'
+                        assert False
             with open(save_to + '/options.pkl', 'wb') as f:
                 pk.dump(self._options, f)
         else:
             self._is_training = False
-            assert save_to is None
             self._pfx = get_random_string() + '_' # avoid name clash in ensemble
             assert load_from is not None
             with open(load_from + '/options.pkl', 'rb') as f:
                 self._options = pk.load(f)
+            if options is not None and 'batch_size' in options:
+                self._options['batch_size'] = options['batch_size']
  
     def _init_params(self, load_from):
         """
@@ -97,6 +99,9 @@ class Net():
     def _init_shared_variables(self):
         """
         Declare and store shared variables for parameters, gradients, and prev_states
+        For options['learn_init_states'], init states are not directly learnable 
+        (gradients are taken wrt v_prev_states, then applied to init states),
+        and hence stored separately from the rest
         """
         self._v_params = OrderedDict()
         self._v_params_wo_init  = OrderedDict()
@@ -122,7 +127,7 @@ class Net():
         """
         Specify layer connections
         Layers return their final internal states (to be used for the next time sequence) as
-            prev_state_update = (v_prev_state, s_final_state)
+            prev_state_update = (v_prev_state, s_new_prev_state)
         which are collected as a list and returned along with the last layer's output
         """
         prev_state_updates = []
@@ -167,15 +172,15 @@ class Net():
             grad_update = (v_grad, s_new_grad)
         Takes inputs as lists instead of OrderedDict
         """
-        s_grads = tt.grad(s_loss, wrt = v_wrt) # OrderedDict -> list
+        s_grads = tt.grad(s_loss, wrt = v_wrt)
         if self._options['grad_clip'] > 0.:
             s_grads = [clip_norm(s_grad, self._options['grad_clip']) for s_grad in s_grads]
         return zip(v_grads, s_grads)
 
     def _setup_param_updates_graph(self, s_lr, v_params, v_grads):
         """
-        Connect learning rate, parameters, gradients, and internal states of optimizer
-        to new values
+        Connect learning rate, parameters, gradients, and internal states of optimizer to
+        new values of parameters, and inform how optimizer should be initiated/updated
             optim_state_init = (v_optim_state, s_init_optim_state)
             param_update     = (v_param, s_new_param) or (v_optim_state, s_new_optim_state)
         Takes inputs as lists instead of OrderedDict
@@ -256,7 +261,7 @@ class Net():
         As a side effect, calling it updates
             _v_prev_states <- _prev_state_updates (has _port_i_input_tbi &
                                                        _port_i_time_t as undetermined input)
-        Note that output is a list of np.ndarray (even if 1 output & scalar)
+        Note that output is a list of np.ndarray (i.e., 0-th element is np.ndarray)
         """
         if self._is_training:
             return th.function(inputs  = [self._port_i_input_tbi, self._port_i_target_tbi,
@@ -281,6 +286,7 @@ class Net():
                                                        _port_i_time_t as undetermined input)
             _v_prev_states <- _prev_state_updates (has _port_i_input_tbi as undetermined input)
         Note that output is a list of np.ndarray (even if 1 output & scalar)
+        To get loss but not update params (for validation), call f_fwd_propagate instead
         """
         assert self._is_training
         return th.function(inputs  = [self._port_i_input_tbi, self._port_i_target_tbi,
@@ -296,8 +302,8 @@ class Net():
             f(lr) -> None
         As a side effect, calling it updates
             _v_params <- _param_updates (has _port_i_lr as undetermined input)
-        Therefore, f_fwd_bwd_propagate must be called prior to this
-        To get loss but not update params (for validation), don't call this 
+        Because it uses _v_grads, f_fwd_bwd_propagate must be called before f_update_v_params
+        To get loss but not update params (for validation), don't call f_update_v_params
         """
         assert self._is_training
         return th.function(inputs  = [self._port_i_lr],
@@ -307,7 +313,7 @@ class Net():
     def compile_f_fwd_bwd_for_init(self):
         """
         NOTE: For the first time step during options['learn_init_states'],
-              call f_ returned by this *instead of* that by compile_f_fwd_bwd_propagate
+              call f_fwd_bwd_for_init *instead of* f_fwd_bwd_propagate
         """
         assert self._is_training and self._options['learn_init_states']
         return th.function(inputs  = [self._port_i_input_tbi, self._port_i_target_tbi,
@@ -321,7 +327,7 @@ class Net():
     def compile_f_update_init_states(self):
         """
         NOTE: For the first time step during options['learn_init_states'],
-              call f_ returned by this *in addition to* that by compile_f_update_v_params
+              call f_update_init_states *in addition to* f_update_v_params
         """
         assert self._is_training and self._options['learn_init_states']
         return th.function(inputs  = [self._port_i_lr],
@@ -334,7 +340,7 @@ class Net():
             f() -> None
         As a side effect, calling it updates
             v_optim_states <- s_init_optim_states (these are stored indirectly in this class)
-        Call f_ returned by this when learning rate has changed
+        Call f_initialize_optimizer when learning rate has changed
         """
         assert self._is_training
         return th.function(inputs  = [],
@@ -380,3 +386,9 @@ class Net():
         if name is None:
             name = 'params'
         os.remove(self._save_to + '/' + name + '.npz')
+    
+    def dimensions(self):
+        """
+        For use during inference
+        """
+        return self._options['input_dim'], self._options['target_dim']

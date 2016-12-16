@@ -26,12 +26,13 @@ class Layer():
         Implements:
             Add this layer's parameters to params
             If learn_init_states, add init_i as well (recurrent layers only)
-            init_i should have the same dimensions as the layer's internal states
+            It should have the same dimensions as the layer's internal state
+            variables and its name must be $_init, matching $_prev below
         Inputs:
            &params  OrderedDict { str : np.ndarray }
             n_in    int
             n_out   int
-            options dict        { str : varies     }
+            options OrderedDict { str : varies     }
             kwargs  dict        { str : varies     } (for any other settings)
         Returns:
             None
@@ -42,12 +43,11 @@ class Layer():
     def add_v_prev_state(self, v_prev_states):
         """
         Implements:
-            Add this layer's v_prev_state to v_prev_states (recurrent layers only)
-            v_prev_state should have the same dimensions as step function's output
-            If there are multiple, they must be added in exactly the same order
-            as in add_param
+            Add this layer's v_prev_state_bi to v_prev_states (recurrent layers only)
+            v_prev_state_bi should have the same dimensions as step function's output
+            (i.e., $_init stacked batch_size times) and its name must be $_prev
         Inputs:
-           &v_prev_states   dict    { str : th.SharedVariable }
+           &v_prev_states   OrderedDict { str : th.SharedVariable }
         Returns:
             None
         """
@@ -63,10 +63,11 @@ class Layer():
             s_below_tbj     symbolic    [n_steps][batch_size][n_in] (even if n_steps == 1)
             s_time_t        symbolic    [n_steps]                   (even if n_steps == 1)
             v_params        OrderedDict { str : th.SharedVariable }
-            v_prev_states   dict        { str : th.SharedVariable } (recurrent layers only)
+            v_prev_states   OrderedDict { str : th.SharedVariable } (recurrent layers only)
         Returns:
             tuple of 
                 s_output_tbi, prev_state_update
+            where prev_state_update = (v_prev_state, s_new_prev_state)
             Receiving side should check if prev_state_update is None before storing
         """
         pass

@@ -33,8 +33,13 @@ def ortho_weight(dim):
     """
     Orthogonal weight init (i.e., all eigenvalues are of magnitude 1)
     """
-    W = np.random.randn(dim, dim) # ~ Gaussian (mu = 0, sigma = 1)
-    U, S, V = np.linalg.svd(W)
+    U = None
+    while U is None:
+        try:
+            W = np.random.randn(dim, dim) # ~ Gaussian (mu = 0, sigma = 1)
+            U, S, V = np.linalg.svd(W)
+        except:
+            pass # suppress probalistic failure
     return U.astype('float32')
 
 # scale = 0.1 is roughly sqrt(6)/sqrt(1024) (in line with Xavier init)

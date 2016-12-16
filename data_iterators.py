@@ -53,7 +53,7 @@ class DataBatchIter():
     
     def read(self, seq_idx):
         """
-        Returns tuple of numpy.ndarray's
+        Returns tuple of np.ndarray's
             [all_timesteps][input_dim], [all_timesteps][target_dim]
         """
         input_ti  = np.fromfile(self.data_root + self.seqs[self.seq_order[seq_idx]] + '.input' , \

@@ -20,6 +20,7 @@ from net import Net
 from data_iterators import DataBatchIter, TimeStepIter
 import time
 import numpy as np
+from subprocess import call
 
 def main():
     options = OrderedDict()
@@ -53,6 +54,10 @@ def main():
     parser.add_argument('--save_to'  , type = str, required = True)
     parser.add_argument('--load_from', type = str)    
     args = parser.parse_args()
+
+    assert 0 == call(str('mkdir -p ' + args.save_to).split())
+    assert 0 == call(str('cp ' + args.data_dir + '/mean.matrix ' + args.save_to).split())
+    assert 0 == call(str('cp ' + args.data_dir + '/whitening.matrix ' + args.save_to).split())
 
     print('----------------------------------------------------------------------')
     print('Data location: ' + args.data_dir)
@@ -179,7 +184,7 @@ def main():
         loss_cur, _ = run_epoch(False, dev_data, None)
         print(lapse_from(start))
 
-        print('Total  trained  frames: ' + str(total_trained_frames  ).rjust(12))
+        print('Total trained frames  : ' + str(total_trained_frames  ).rjust(12))
         print('Total discarded frames: ' + str(total_discarded_frames).rjust(12))
 
         print('Loss: ' + str(loss_cur), end = ' ')
@@ -245,17 +250,17 @@ def main():
 
     print('')
     print('Done')
-    print('Total  trained  frames: ' + str( total_trained_frames ).rjust(12))
+    print('Total trained frames  : ' + str( total_trained_frames ).rjust(12))
     print('Total discarded frames: ' + str(total_discarded_frames).rjust(12))
     print('')
 
     print('Best network:')
     print('Train set')
     loss_train, _ = run_epoch(False, train_data, None)
-    print('    Loss: ' + str(loss_train))
+    print('Loss: ' + str(loss_train))
     print('Dev set')
     loss_dev, _   = run_epoch(False, dev_data, None)
-    print('    Loss: ' + str(loss_dev))
+    print('Loss: ' + str(loss_dev))
 
 if __name__ == '__main__':
     main()

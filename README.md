@@ -13,6 +13,10 @@ loosely correlated target.
 
 # How to use
 
+## Prerequisites
+- Theano (developed on 0.9.0.dev4-py2.7): follow through their installation instructions using Miniconda, along with the bleeding-edge installation & latest version of libgpuarray
+
+
 ## Options
 - input_dim, target_dim : 44, 1
 - unit_type             : 'LSTM'
@@ -105,9 +109,6 @@ loosely correlated target.
 
 
 ## TODO
-- Ensemble
-- test pybind11 (are Python states kept between calls from C++ code)
-    if not, use zeroMQ
 
 
 ## Miscellaneous notes
