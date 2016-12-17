@@ -12,7 +12,7 @@ from abc import ABCMeta, abstractmethod
 import numpy as np
 import theano as th
 import theano.tensor as tt
-from utils import ortho_weight, norm_weight
+from utils import unif_weight
 
 class Layer():
     __metaclass__ = ABCMeta
@@ -75,7 +75,10 @@ class Layer():
     def pfx(self, s):
         return '%s_%s' % (self.name, s)
 
-    def slice(self, x_bi, n, stride):
+    def slice1(self, x_i, n, stride):
+        return x_i[n * stride : (n + 1) * stride]
+
+    def slice2(self, x_bi, n, stride):
         return x_bi[:, n * stride : (n + 1) * stride]
 
     def layer_norm(self, x_bi, s_i, b_i):
@@ -109,8 +112,9 @@ class FCLayer(Layer):
         assert callable(eval(kwargs['act']))
         self._act = eval(kwargs['act'])
 
-        params[self.pfx('W')] = norm_weight(n_in, n_out)
-        params[self.pfx('b')] = np.zeros(n_out).astype('float32')
+        # In Fractal, W & b were both ~ Uniform [-0.02, 0.02)
+        params[self.pfx('W')] = unif_weight(options, n_in, n_out)
+        params[self.pfx('b')] = unif_weight(options, n_out)
 
     def add_v_prev_state(self, v_prev_states):
         pass
@@ -124,26 +128,31 @@ class LSTMLayer(Layer):
     def add_param(self, params, n_in, n_out, options, **kwargs):
         self.n_out = n_out
         self.batch_size = options['batch_size']
+        self.use_peephole = options['unit_peephole']
         self.use_layer_norm = options['layer_norm']
 
+        # In Fractal, W, b, U, ph were all ~ Uniform [-0.02, 0.02)
         # input to (i, f, o, c) [n_in][4 * n_out]
-        params[self.pfx('W')] = np.concatenate([norm_weight(n_in, n_out), norm_weight(n_in, n_out),
-                                                norm_weight(n_in, n_out), norm_weight(n_in, n_out)], axis = 1)
-        params[self.pfx('b')] = np.zeros(4 * n_out).astype('float32')
+        params[self.pfx('W')] = np.concatenate([unif_weight(options, n_in, n_out),
+                                                unif_weight(options, n_in, n_out),
+                                                unif_weight(options, n_in, n_out),
+                                                unif_weight(options, n_in, n_out)], axis = 1)
+        params[self.pfx('b')] = unif_weight(options, 4 * n_out)
         # hidden to (i, f, o, c) [n_out][4 * n_out]
-        params[self.pfx('U')] = np.concatenate([ortho_weight(n_out), ortho_weight(n_out),
-                                                ortho_weight(n_out), ortho_weight(n_out)], axis = 1)
+        params[self.pfx('U')] = np.concatenate([unif_weight(options, n_out, n_out),
+                                                unif_weight(options, n_out, n_out),
+                                                unif_weight(options, n_out, n_out),
+                                                unif_weight(options, n_out, n_out)], axis = 1)
+        
+        if options['unit_peephole']:
+            params[self.pfx('ph')] = unif_weight(options, 3 * n_out)
 
         if options['learn_init_states']:
             params[self.pfx('init')] = np.zeros(2 * n_out).astype('float32') # init_h, init_c
-        
+
         if options['layer_norm']:
-            params[self.pfx('s0')] = np.ones (4 * n_out).astype('float32')
-            params[self.pfx('s1')] = np.ones (4 * n_out).astype('float32')
-            params[self.pfx('s2')] = np.ones (1 * n_out).astype('float32')
-            params[self.pfx('b0')] = np.zeros(4 * n_out).astype('float32')
-            params[self.pfx('b1')] = np.zeros(4 * n_out).astype('float32')
-            params[self.pfx('b2')] = np.zeros(1 * n_out).astype('float32')
+            params[self.pfx('ln_s')] = np.ones (4 * n_out).astype('float32')
+            params[self.pfx('ln_b')] = np.zeros(4 * n_out).astype('float32')
 
         if options['learn_clock_params']:
             self.add_clock_params(params, n_out, options)
@@ -164,15 +173,23 @@ class LSTMLayer(Layer):
         n_batch = s_below_tbj.shape[1]
         n_out   = U_i4i.shape[0]
 
+        # options['unit_peephole']
+        if not self.use_peephole:
+            p = [0.] * 3
+        else:
+            p = [self.slice1(v_param('ph'), i, n_out) for i in range(3)]
+            non_seqs.append(v_param('ph'))
+
         # options['layer_norm']
         if not self.use_layer_norm:
             thru = lambda x_bi: x_bi
-            f = [thru] * 3
+            l = [thru] * 4
         else:
-            f = [(lambda x_bi, i = i: \
-                      self.layer_norm(x_bi, v_param('s' + str(i)), v_param('b' + str(i)))) \
-                 for i in range(3)] # i = i part needed due to Python 2.7's limitations
-            non_seqs.extend(map(v_param, 's0 s1 s2 b0 b1 b2'.split()))
+            l = [(lambda x_bi, i = i: \
+                      self.layer_norm(x_bi, self.slice1(v_param('ln_s'), i, n_out),  \
+                                            self.slice1(v_param('ln_b'), i, n_out))) \
+                 for i in range(4)] # i = i part due to Python 2.7 limitations
+            non_seqs.extend([v_param('ln_s'), v_param('ln_b')])
 
         # options['learn_clock_params']
         if s_time_t is None:
@@ -187,17 +204,16 @@ class LSTMLayer(Layer):
         prev_c_bi = prev_state_b2i[:, n_out : 2 * n_out]
 
         def step(mask_i, below_b4i, prev_h_bi, prev_c_bi, *args):
-            preact_b4i = f[0](below_b4i) + f[1](tt.dot(prev_h_bi, U_i4i)) 
+            preact_b4i = below_b4i + tt.dot(prev_h_bi, U_i4i) 
 
-            i_bi = tt.nnet.sigmoid(self.slice(preact_b4i, 0, n_out))
-            f_bi = tt.nnet.sigmoid(self.slice(preact_b4i, 1, n_out))
-            o_bi = tt.nnet.sigmoid(self.slice(preact_b4i, 2, n_out))
-            c_bi = tt.tanh        (self.slice(preact_b4i, 3, n_out))
+            i_bi = tt.nnet.sigmoid(l[0](self.slice2(preact_b4i, 0, n_out) + p[0] * prev_c_bi))
+            f_bi = tt.nnet.sigmoid(l[1](self.slice2(preact_b4i, 1, n_out) + p[1] * prev_c_bi))
 
-            c_bi = f_bi * prev_c_bi + i_bi * c_bi
+            c_bi = i_bi * tt.tanh (l[2](self.slice2(preact_b4i, 2, n_out))) + f_bi * prev_c_bi
             c_bi = mask_i * c_bi + (1. - mask_i) * prev_c_bi
 
-            h_bi = o_bi * tt.tanh(f[2](c_bi))
+            o_bi = tt.nnet.sigmoid(l[3](self.slice2(preact_b4i, 3, n_out) + p[2] * c_bi))
+            h_bi = o_bi * tt.tanh(c_bi)
             h_bi = mask_i * h_bi + (1. - mask_i) * prev_h_bi 
 
             return h_bi, c_bi
@@ -226,30 +242,24 @@ class GRULayer(Layer):
         self.use_layer_norm = options['layer_norm']
 
         # input to (r, u) [n_in][2 * n_out]
-        params[self.pfx('W')] = np.concatenate([norm_weight(n_in, n_out),
-                                                norm_weight(n_in, n_out)], axis = 1)
-        params[self.pfx('b')] = np.zeros(2 * n_out).astype('float32')
+        params[self.pfx('W')] = np.concatenate([unif_weight(options, n_in, n_out),
+                                                unif_weight(options, n_in, n_out)], axis = 1)
+        params[self.pfx('b')] = unif_weight(options, 2 * n_out)
         # hidden to (r, u) [n_out][2 * n_out]
-        params[self.pfx('U')] = np.concatenate([ortho_weight(n_out),
-                                                ortho_weight(n_out)], axis = 1)
+        params[self.pfx('U')] = np.concatenate([unif_weight(options, n_out, n_out),
+                                                unif_weight(options, n_out, n_out)], axis = 1)
         # input to hidden [n_in][n_out]
-        params[self.pfx('Wh')] = norm_weight(n_in, n_out)
-        params[self.pfx('bh')] = np.zeros(n_out).astype('float32')
+        params[self.pfx('Wh')] = unif_weight(options, n_in, n_out)
+        params[self.pfx('bh')] = unif_weight(options, n_out)
         # hidden to hidden [n_out][n_out]
-        params[self.pfx('Uh')] = ortho_weight(n_out)
+        params[self.pfx('Uh')] = unif_weight(options, n_out, n_out)
         
         if options['learn_init_states']:
-            params[self.pfx('init')] = np.zeros(n_out).astype('float32') # init_h, init_c
+            params[self.pfx('init')] = np.zeros(n_out).astype('float32') # init_h
         
         if options['layer_norm']:
-            params[self.pfx('s0')] = np.ones (2 * n_out).astype('float32')
-            params[self.pfx('s1')] = np.ones (2 * n_out).astype('float32')
-            params[self.pfx('s2')] = np.ones (1 * n_out).astype('float32')
-            params[self.pfx('s3')] = np.ones (1 * n_out).astype('float32')
-            params[self.pfx('b0')] = np.zeros(2 * n_out).astype('float32')
-            params[self.pfx('b1')] = np.zeros(2 * n_out).astype('float32')
-            params[self.pfx('b2')] = np.zeros(1 * n_out).astype('float32')
-            params[self.pfx('b3')] = np.zeros(1 * n_out).astype('float32')
+            params[self.pfx('ln_s')] = np.ones (3 * n_out).astype('float32')
+            params[self.pfx('ln_b')] = np.zeros(3 * n_out).astype('float32')
 
         if options['learn_clock_params']:
             self.add_clock_params(params, n_out, options)
@@ -276,12 +286,13 @@ class GRULayer(Layer):
         # options['layer_norm']
         if not self.use_layer_norm:
             thru = lambda x_bi: x_bi
-            f = [thru] * 4
+            l = [thru] * 3
         else:
-            f = [(lambda x_bi, i = i: \
-                      self.layer_norm(x_bi, v_param('s' + str(i)), v_param('b' + str(i)))) \
-                 for i in range(4)] # i = i part needed due to Python 2.7's limitations
-            non_seqs.extend(map(v_param, 's0 s1 s2 s3 b0 b1 b2 b3'.split()))
+            l = [(lambda x_bi, i = i: \
+                      self.layer_norm(x_bi, self.slice1(v_param('ln_s'), i, n_out),  \
+                                            self.slice1(v_param('ln_b'), i, n_out))) \
+                 for i in range(3)] # i = i part due to Python 2.7 limitations
+            non_seqs.extend([v_param('ln_s'), v_param('ln_b')])
 
         # options['learn_clock_params']
         if s_time_t is None:
@@ -294,12 +305,12 @@ class GRULayer(Layer):
         prev_h_bi  = v_prev_states[self.pfx('prev')]
 
         def step(mask_i, below_b2i, belowh_bi, prev_h_bi, *args):
-            preact_b2i = f[0](below_b2i) + f[1](tt.dot(prev_h_bi, U_i2i))
+            preact_b2i = below_b2i + tt.dot(prev_h_bi, U_i2i)
 
-            r_bi = tt.nnet.sigmoid(self.slice(preact_b2i, 0, n_out))
-            u_bi = tt.nnet.sigmoid(self.slice(preact_b2i, 1, n_out))
+            r_bi = tt.nnet.sigmoid(l[0](self.slice2(preact_b2i, 0, n_out)))
+            u_bi = tt.nnet.sigmoid(l[1](self.slice2(preact_b2i, 1, n_out)))
 
-            c_bi = tt.tanh(f[2](belowh_bi) + r_bi * f[3](tt.dot(prev_h_bi, Uh_ii)))
+            c_bi = tt.tanh(l[2](belowh_bi + r_bi * tt.dot(prev_h_bi, Uh_ii)))
 
             h_bi = (1. - u_bi) * prev_h_bi + u_bi * c_bi
             h_bi = mask_i * h_bi + (1. - mask_i) * prev_h_bi

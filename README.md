@@ -109,7 +109,12 @@ loosely correlated target.
 
 
 ## TODO
-
+Try to reproduce Fractal results first
+- [testing] Peephole LSTM
+- [testing] Uniform init instead of ortho ('init_use_ortho', 'init_scale', initializers take both 1D/2D shape and options directly)
+- [testing] Other optimizers (AdaDelta, RMSProp, SGD/Nesterov -- see Fractal); no AdaGrad
+- ID embedding; one hot ID -> Linear FC (of smaller dim) and add as input_bi to each layer; use tt.to_one_hot 
+- Reinforcement learning
 
 ## Miscellaneous notes
 * [SliceableOrderedDict](http://stackoverflow.com/questions/30975339/slicing-a-python-ordereddict)

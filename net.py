@@ -15,7 +15,8 @@ import os
 
 from layers import FCLayer, LSTMLayer, GRULayer
 from utils import MSE_loss, clip_norm, get_random_string
-from optimizers import adam
+from optimizers import sgd_update, momentum_update, nesterov_update, \
+                       vanilla_force, adadelta_force, rmsprop_force, adam_force
 
 import numpy as np
 import theano as th
@@ -172,10 +173,11 @@ class Net():
             grad_update = (v_grad, s_new_grad)
         Takes inputs as lists instead of OrderedDict
         """
-        s_grads = tt.grad(s_loss, wrt = v_wrt)
-        if self._options['grad_clip'] > 0.:
-            s_grads = [clip_norm(s_grad, self._options['grad_clip']) for s_grad in s_grads]
-        return zip(v_grads, s_grads)
+        s_new_grads = tt.grad(s_loss, wrt = v_wrt)
+        if 'grad_norm_clip' in self._options:
+            s_new_grads = [clip_norm(s_grad, self._options['grad_norm_clip']) \
+                           for s_grad in s_new_grads]
+        return zip(v_grads, s_new_grads)
 
     def _setup_param_updates_graph(self, s_lr, v_params, v_grads):
         """
@@ -186,9 +188,15 @@ class Net():
         Takes inputs as lists instead of OrderedDict
         Assumes that v_grads has been updated prior to applying param_updates returned here
         """
-        return eval(self._options['optimizer'])(s_lr     = s_lr,
-                                                v_params = v_params,
-                                                v_grads  = v_grads)
+        optim_f_inits, optim_f_updates, s_forces = \
+            eval(self._options['force_type'] + '_force')(options = self._options,
+                                                         s_lr    = s_lr,
+                                                         v_grads = v_grads)
+        optim_u_inits, optim_u_param_updates = \
+            eval(self._options['update_type'] + '_update')(options  = self._options,
+                                                           v_params = v_params,
+                                                           s_forces = s_forces)
+        return optim_f_inits + optim_u_inits, optim_f_updates + optim_u_param_updates
 
     def _setup_training_graph(self):
         """
