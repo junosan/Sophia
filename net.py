@@ -94,8 +94,8 @@ class Net():
         if load_from is not None:
             len_pfx = len(self._pfx)
             params = np.load(load_from + '/params.npz') # NpzFile object
-            for k, param in self._params.iteritems():
-                param = params[k[len_pfx:]] # saved params don't have prefix
+            for k in self._params.iterkeys():
+                self._params[k] = params[k[len_pfx:]] # saved params don't have prefix
 
     def _init_shared_variables(self):
         """
