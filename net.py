@@ -47,24 +47,31 @@ class Net():
     def _configure(self, options, save_to, load_from):
         if save_to is not None:
             self._is_training = True
+
             assert options is not None
             self._options = options
+
             self._save_to = save_to
             self._pfx = ''
+            
             if load_from is not None:
                 with open(load_from + '/options.pkl', 'rb') as f:
                     loaded_options = pk.load(f)
                     if self._options != loaded_options:
                         print '[Error] Mismatching options in loaded model'
                         assert False
+            
             with open(save_to + '/options.pkl', 'wb') as f:
                 pk.dump(self._options, f)
         else:
             self._is_training = False
+
             self._pfx = get_random_string() + '_' # avoid name clash in ensemble
+            
             assert load_from is not None
             with open(load_from + '/options.pkl', 'rb') as f:
                 self._options = pk.load(f)
+            
             if options is not None and 'batch_size' in options:
                 self._options['batch_size'] = options['batch_size']
  
@@ -74,6 +81,18 @@ class Net():
         Load parameter values from file if applicable
         """
         self._params = OrderedDict()
+
+        if not self._options['learn_id_embedding']:
+            add = 0
+        else:
+            self._id_embedder = FCLayer(self._pfx + 'FC_id_embedder')
+            self._id_embedder.add_param(params  = self._params,
+                                        n_in    = self._options['id_count'],
+                                        n_out   = self._options['id_embedding_dim'],
+                                        options = self._options,
+                                        act     = 'lambda x: x')
+            add = self._options['id_embedding_dim']
+
         self._layers = []
         D = self._options['net_depth']
         assert D > 0
@@ -81,16 +100,18 @@ class Net():
             self._layers.append(eval(self._options['unit_type'] + 'Layer') \
                                      (self._pfx + self._options['unit_type'] + '_' + str(i)))
             self._layers[i].add_param(params  = self._params,
-                                      n_in    = self._options['net_width'] if i > 0 else \
-                                                self._options['input_dim'],
+                                      n_in    = add + \
+                                                (self._options['net_width'] if i > 0 else \
+                                                 self._options['input_dim']),
                                       n_out   = self._options['net_width'],
                                       options = self._options)
         self._layers.append(FCLayer(self._pfx + 'FC_output'))
         self._layers[D].add_param    (params  = self._params,
-                                      n_in    = self._options['net_width'],
+                                      n_in    = add + self._options['net_width'],
                                       n_out   = self._options['target_dim'],
                                       options = self._options,
                                       act     = 'lambda x: x')
+        
         if load_from is not None:
             len_pfx = len(self._pfx)
             params = np.load(load_from + '/params.npz') # NpzFile object
@@ -109,22 +130,26 @@ class Net():
         for k, v in self._params.iteritems():
             self._v_params[k] = th.shared(v, name = k)
             if k[-4:] != 'init':
-                self._v_params_wo_init[k] = self._v_params[k]                
+                self._v_params_wo_init[k] = self._v_params[k]
+
         self._v_prev_states = OrderedDict()
         for layer in self._layers:
             layer.add_v_prev_state(self._v_prev_states)
+
         if self._is_training:
             self._v_grads = [th.shared(v.get_value() * 0., name = k + '_grad') \
                              for k, v in self._v_params_wo_init.iteritems()]
+
             if self._options['learn_init_states']:
                 self._v_params_for_init  = OrderedDict()
                 for k, v in self._v_params.iteritems():
                     if k[-4:] == 'init':
                         self._v_params_for_init[k] = v
+                
                 self._v_grads_for_init = [th.shared(v.get_value() * 0., name = k + '_grad') \
                                           for k, v in self._v_prev_states.iteritems()]
 
-    def _setup_forward_graph(self, s_input_tbi, s_time_t, v_params, v_prev_states):
+    def _setup_forward_graph(self, s_input_tbi, s_time_t, s_id_idx_b, v_params, v_prev_states):
         """
         Specify layer connections
         Layers return their final internal states (to be used for the next time sequence) as
@@ -132,32 +157,49 @@ class Net():
         which are collected as a list and returned along with the last layer's output
         """
         prev_state_updates = []
+
+        if not self._options['learn_id_embedding']:
+            cat = lambda s_below_tbj: s_below_tbj
+        else:
+            s_id_emb_bi, _ = self._id_embedder. \
+                setup_graph(s_below_tbj   = tt.extra_ops.to_one_hot \
+                                                (s_id_idx_b, self._options['id_count']),
+                            s_time_t      = None,
+                            v_params      = v_params,
+                            v_prev_states = v_prev_states)
+            s_id_emb_tbi = tt.tile(s_id_emb_bi, (s_input_tbi.shape[0], 1, 1))
+            cat = lambda s_below_tbj: tt.concatenate([s_below_tbj, s_id_emb_tbi], axis = 2)
+
         D = self._options['net_depth']
         s_outputs = [None] * (D + 1)  # (RNN) * D + FC
-        s_outputs.append(s_input_tbi) # put it at index -1
+        s_outputs.append(s_input_tbi) # put input at index -1
+
         # vertical stack: input -> layer[0] -> ... -> layer[D - 1] -> output
         for i in range(D + 1):
             s_outputs[i], update = self._layers[i]. \
-                setup_graph(s_below_tbj   = s_outputs[i - 1],
+                setup_graph(s_below_tbj   = cat(s_outputs[i - 1]),
                             s_time_t      = s_time_t if self._options['learn_clock_params'] else None,
                             v_params      = v_params,
                             v_prev_states = v_prev_states)
             if update is not None:
                 prev_state_updates.append(update)
+        
         return s_outputs[D], prev_state_updates
 
     def _setup_inference_graph(self):
         """
         Connect graphs together for inference and store input/output ports and updates
-        Input port : _port_i_input, _port_i_time
+        Input port : _port_i_input, _port_i_time, _port_i_id_idx
         Output port: _port_o_output
         Updates    : _prev_state_updates
         """
         self._port_i_input_tbi = tt.tensor3(name = 'port_i_input' , dtype='float32')
         self._port_i_time_t    = tt.vector (name = 'port_i_time'  , dtype='float32')
+        self._port_i_id_idx_b  = tt.vector (name = 'port_i_id_idx', dtype='int32'  )
         self._port_o_output, self._prev_state_updates = \
                            self._setup_forward_graph(s_input_tbi   = self._port_i_input_tbi,
                                                      s_time_t      = self._port_i_time_t,
+                                                     s_id_idx_b    = self._port_i_id_idx_b,
                                                      v_params      = self._v_params,
                                                      v_prev_states = self._v_prev_states)
 
@@ -201,18 +243,20 @@ class Net():
     def _setup_training_graph(self):
         """
         Connect graphs together for training and store input/output ports and updates
-        Input ports: _port_i_input, _port_i_target, _port_i_time, _port_i_lr, 
+        Input ports: _port_i_input, _port_i_target, _port_i_time, _port_i_id_idx_b, _port_i_lr, 
         Output port: _port_o_loss
         Updates    : _prev_state_updates, _grad_updates, _optim_state_inits, _param_updates
         """
         self._port_i_input_tbi  = tt.tensor3(name = 'port_i_input' , dtype='float32')
         self._port_i_target_tbi = tt.tensor3(name = 'port_i_target', dtype='float32')
         self._port_i_time_t     = tt.vector (name = 'port_i_time'  , dtype='float32')
+        self._port_i_id_idx_b   = tt.vector (name = 'port_i_id_idx', dtype='int32'  )
         self._port_i_lr         = tt.scalar (name = 'port_i_lr'    , dtype='float32')
 
         s_output_tbi, self._prev_state_updates = \
                            self._setup_forward_graph(s_input_tbi   = self._port_i_input_tbi,
                                                      s_time_t      = self._port_i_time_t,
+                                                     s_id_idx_b    = self._port_i_id_idx_b,
                                                      v_params      = self._v_params,
                                                      v_prev_states = self._v_prev_states)
 
@@ -264,22 +308,22 @@ class Net():
     def compile_f_fwd_propagate(self):
         """
         Compile a callable object of signature
-            f(input_tbi, target_tbi, time_t) -> loss (for training)
-            f(input_tbi, time_t) -> output_tbi       (for inference)
+            f(input_tbi, target_tbi, time_t, id_idx_b) -> loss (for training)
+            f(input_tbi, time_t, id_idx_b) -> output_tbi       (for inference)
         As a side effect, calling it updates
-            _v_prev_states <- _prev_state_updates (has _port_i_input_tbi &
-                                                       _port_i_time_t as undetermined input)
+            _v_prev_states <- _prev_state_updates
         Note that output is a list of np.ndarray (i.e., 0-th element is np.ndarray)
         """
         if self._is_training:
             return th.function(inputs  = [self._port_i_input_tbi, self._port_i_target_tbi,
-                                          self._port_i_time_t],
+                                          self._port_i_time_t   , self._port_i_id_idx_b],
                                outputs = [self._port_o_loss],
                                updates = self._prev_state_updates,
                        on_unused_input = 'raise' if self._options['learn_clock_params'] \
                                          else 'ignore')
         else:
-            return th.function(inputs  = [self._port_i_input_tbi, self._port_i_time_t],
+            return th.function(inputs  = [self._port_i_input_tbi, self._port_i_time_t,
+                                          self._port_i_id_idx_b],
                                outputs = [self._port_o_output],
                                updates = self._prev_state_updates,
                        on_unused_input = 'raise' if self._options['learn_clock_params'] \
@@ -288,17 +332,16 @@ class Net():
     def compile_f_fwd_bwd_propagate(self):
         """
         Compile a callable object of signature
-            f(input_tbi, target_tbi, time_t) -> loss
+            f(input_tbi, target_tbi, time_t, id_idx_b) -> loss
         As a side effect, calling it updates
-            _v_grads       <- _grad_updates       (has _port_i_input_tbi, _port_i_target_tbi, and
-                                                       _port_i_time_t as undetermined input)
-            _v_prev_states <- _prev_state_updates (has _port_i_input_tbi as undetermined input)
+            _v_grads       <- _grad_updates
+            _v_prev_states <- _prev_state_updates
         Note that output is a list of np.ndarray (even if 1 output & scalar)
         To get loss but not update params (for validation), call f_fwd_propagate instead
         """
         assert self._is_training
         return th.function(inputs  = [self._port_i_input_tbi, self._port_i_target_tbi,
-                                      self._port_i_time_t],
+                                      self._port_i_time_t   , self._port_i_id_idx_b],
                            outputs = [self._port_o_loss],
                            updates = self._grad_updates + self._prev_state_updates,
                            on_unused_input = 'raise' if self._options['learn_clock_params'] \
@@ -309,7 +352,7 @@ class Net():
         Compile a callable object of signature
             f(lr) -> None
         As a side effect, calling it updates
-            _v_params <- _param_updates (has _port_i_lr as undetermined input)
+            _v_params <- _param_updates
         Because it uses _v_grads, f_fwd_bwd_propagate must be called before f_update_v_params
         To get loss but not update params (for validation), don't call f_update_v_params
         """
@@ -325,7 +368,7 @@ class Net():
         """
         assert self._is_training and self._options['learn_init_states']
         return th.function(inputs  = [self._port_i_input_tbi, self._port_i_target_tbi,
-                                      self._port_i_time_t],
+                                      self._port_i_time_t   , self._port_i_id_idx_b],
                            outputs = [self._port_o_loss],
                            updates = self._grad_updates + self._prev_state_updates + \
                                      self._grad_updates_for_init,
@@ -397,6 +440,13 @@ class Net():
     
     def dimensions(self):
         """
-        For use during inference
+        Intended for use during inference
         """
         return self._options['input_dim'], self._options['target_dim']
+    
+    def save_param(self, param_name, filename):
+        """
+        Cannot be used during training as params is not kept up to date
+        """
+        assert not self._is_training and self._pfx + param_name in self._params
+        np.savez(filename, **{ param_name : self._params[self._pfx + param_name] })

@@ -128,7 +128,7 @@ class LSTMLayer(Layer):
     def add_param(self, params, n_in, n_out, options, **kwargs):
         self.n_out = n_out
         self.batch_size = options['batch_size']
-        self.use_peephole = options['unit_peephole']
+        self.use_peephole = options['lstm_peephole']
         self.use_layer_norm = options['layer_norm']
 
         # In Fractal, W, b, U, ph were all ~ Uniform [-0.02, 0.02)
@@ -144,7 +144,7 @@ class LSTMLayer(Layer):
                                                 unif_weight(options, n_out, n_out),
                                                 unif_weight(options, n_out, n_out)], axis = 1)
         
-        if options['unit_peephole']:
+        if options['lstm_peephole']:
             params[self.pfx('ph')] = unif_weight(options, 3 * n_out)
 
         if options['learn_init_states']:
@@ -173,7 +173,7 @@ class LSTMLayer(Layer):
         n_batch = s_below_tbj.shape[1]
         n_out   = U_i4i.shape[0]
 
-        # options['unit_peephole']
+        # options['lstm_peephole']
         if not self.use_peephole:
             p = [0.] * 3
         else:

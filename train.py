@@ -17,7 +17,7 @@ from __future__ import print_function # switches print to Python 3 version for e
 from collections import OrderedDict
 import argparse
 from net import Net
-from data_iterators import DataBatchIter, TimeStepIter
+from data import build_id_idx, DataBatchIter, TimeStepIter
 import time
 import numpy as np
 from subprocess import call
@@ -28,7 +28,7 @@ def main():
     options['input_dim']          = 44
     options['target_dim']         = 1
     options['unit_type']          = 'LSTM'     # choose from 'FC', 'LSTM', 'GRU'
-    options['unit_peephole']      = True       # for LSTM
+    options['lstm_peephole']      = True
     options['net_width']          = 1024
     options['net_depth']          = 4
     options['batch_size']         = 64
@@ -43,13 +43,16 @@ def main():
     # options['clock_t_exp_hi']     = 6.         # for learn_clock_params
     # options['clock_r_on']         = 0.2        # for learn_clock_params
     # options['clock_leak_rate']    = 0.001      # for learn_clock_params
+    options['id_count']           = 200        # do not comment out
+    options['learn_id_embedding'] = False
+    # options['id_embedding_dim']   = 16
     # options['grad_norm_clip']     = 2.         # comment out to turn off
     options['update_type']        = 'nesterov' # choose from 'sgd', 'momentum', 'nesterov'
     options['update_mu']          = 0.9        # for momentum, nesterov
     options['force_type']         = 'adadelta' # choose from 'vanilla', 'adadelta', 'rmsprop', 'adam'
     options['force_ms_decay']     = 0.99       # for adadelta, rmsprop
-    # options['force_adam_b1']      = 0.9        # for adam
-    # options['force_adam_b2']      = 0.999      # for adam
+    # options['force_adam_b1']      = 0.9        
+    # options['force_adam_b2']      = 0.999      
     options['lr_init_val']        = 1e-5
     options['lr_lower_bound']     = 1e-7
     options['lr_decay_rate']      = 0.5
@@ -80,9 +83,6 @@ def main():
     print('----------------------------------------------------------------------')
 
     lapse_from = lambda start: '(' + ('%.1f' % (time.time() - start)).rjust(6) + ' sec)' 
-    
-    # from datetime import datetime
-    # datetime.now().strftime('%Y%m%d %H:%M:%S')
 
     print('Setting up expression graph...   ', end = ' ')
     start = time.time()
@@ -106,21 +106,34 @@ def main():
     f_initialize_optimizer = net.compile_f_initialize_optimizer()
     print(lapse_from(start))
 
+    # for options['learn_id_embedding']
+    id_idx = build_id_idx(args.data_dir + '/train.list')
+    assert len(id_idx) == options['id_count']
+    with open(args.save_to + '/ids.order', 'w') as f:
+        f.write(';'.join(id_idx.iterkeys())) # code_0;...;code_N-1 (for Sibyl)
+
     train_data = DataBatchIter(list_file  = args.data_dir + '/train.list',
                                input_dim  = options['input_dim'],
                                target_dim = options['target_dim'],
-                               batch_size = options['batch_size'])
+                               batch_size = options['batch_size'],
+                               id_idx     = id_idx)
     dev_data   = DataBatchIter(list_file  = args.data_dir + '/dev.list',
                                input_dim  = options['input_dim'],
                                target_dim = options['target_dim'],
-                               batch_size = options['batch_size'])
+                               batch_size = options['batch_size'],
+                               id_idx     = id_idx)
     
-    def run_epoch(bool_train, data_iter, lr_cur):
+    def run_epoch(data_iter, lr_cur):
+        """
+        lr_cur sets the running mode
+            float   training
+            None    inference
+        """
         losses = []
         frames = []
         frames_seen = 0
         finished = False
-        for input_tbi, target_tbi, batch_idx in data_iter:
+        for input_tbi, target_tbi, id_idx_b, batch_idx in data_iter:
             f_initialize_states()
             for input_step_tbi, target_step_tbi, time_t in \
                     TimeStepIter(input_tbi       = input_tbi,
@@ -128,18 +141,18 @@ def main():
                                  step_size       = options['step_size'],
                                  first_step_hint = batch_idx if options['rolling_first_step'] \
                                                    else 0):
-                if bool_train:
+                if lr_cur is not None:
                     if options['learn_init_states'] and time_t[0] == 0:
-                        loss = f_fwd_bwd_for_init(input_step_tbi, target_step_tbi, time_t)
+                        loss = f_fwd_bwd_for_init(input_step_tbi, target_step_tbi, time_t, id_idx_b)
                     else:
-                        loss = f_fwd_bwd_propagate(input_step_tbi, target_step_tbi, time_t)
+                        loss = f_fwd_bwd_propagate(input_step_tbi, target_step_tbi, time_t, id_idx_b)
                 else:
-                    loss = f_fwd_propagate(input_step_tbi, target_step_tbi, time_t)
+                    loss = f_fwd_propagate(input_step_tbi, target_step_tbi, time_t, id_idx_b)
                 losses.append(np.asscalar(loss[0])) 
                 frame = input_step_tbi.shape[0] * input_step_tbi.shape[1]
                 frames.append(frame)
                 frames_seen += frame
-                if bool_train:
+                if lr_cur is not None:
                     f_update_v_params(lr_cur)
                     if options['learn_init_states'] and time_t[0] == 0:
                         f_update_init_states(lr_cur)
@@ -150,6 +163,12 @@ def main():
                 break
         return np.sum(np.array(losses) * np.array(frames)) / float(frames_seen), frames_seen
     
+
+    """
+    Scheduled annealing with patience
+    From: https://github.com/KyuyeonHwang/Fractal
+    """
+
     # Names for saving/loading
     name_pivot = '0'
     name_prev  = '1'
@@ -179,7 +198,7 @@ def main():
         print('----------------------------------------------------------------------')
         print('Training...  ', end = ' ')
         start = time.time()
-        _, trained_frames = run_epoch(True, train_data, lr)
+        _, trained_frames = run_epoch(train_data, lr)
         print(lapse_from(start))
 
         total_trained_frames += trained_frames
@@ -189,7 +208,7 @@ def main():
 
         print('Evaluating...', end = ' ')
         start = time.time()
-        loss_cur, _ = run_epoch(False, dev_data, None)
+        loss_cur, _ = run_epoch(dev_data, None)
         print(lapse_from(start))
 
         print('Total trained frames  : ' + str(total_trained_frames  ).rjust(12))
@@ -241,9 +260,7 @@ def main():
             loss_pivot = loss_prev
             loss_prev  = loss_cur
 
-            temp = name_pivot
-            name_pivot = name_prev
-            name_prev = temp
+            name_pivot, name_prev = name_prev, name_pivot
 
             net.save_v_params_to_workspace(name_prev)
 
@@ -264,12 +281,11 @@ def main():
 
     print('Best network:')
     print('Train set')
-    loss_train, _ = run_epoch(False, train_data, None)
+    loss_train, _ = run_epoch(train_data, None)
     print('Loss: ' + str(loss_train))
     print('Dev set')
-    loss_dev, _   = run_epoch(False, dev_data, None)
+    loss_dev, _   = run_epoch(dev_data, None)
     print('Loss: ' + str(loss_dev))
 
 if __name__ == '__main__':
     main()
-
