@@ -16,7 +16,8 @@ def seq_to_id(seq):
 
 def build_id_idx(list_file):
     """
-    id_idx['sequence id'] = one-hot encoding index
+    This needs to be saved and used for inference as well
+        id_idx['sequence id'] = one-hot encoding index
     """
     id_idx = OrderedDict()
     with open(list_file) as f:
@@ -32,9 +33,9 @@ class DataBatchIter():
           for input_tbi, target_tbi, id_idx_b, batch_idx in DataBatchIter(args):
               (loop content)
     - Upon each iteration, returns tuple of np.ndarray's and batch_idx
-          input     float32 [all_timesteps][batch_size][input_dim ],
-          target    float32 [all_timesteps][batch_size][target_dim],
-          id_idx    int     [batch_size],
+          input     float32 [all_timesteps][batch_size][input_dim ]
+          target    float32 [all_timesteps][batch_size][target_dim]
+          id_idx    int     [batch_size]
           batch_idx (increases indefinitely every iteration)
       randomly shuffled in batch dimension
     - Files are read lazily when next() is called
@@ -111,31 +112,45 @@ class DataBatchIter():
 
 class TimeStepIter():
     """
+    Creates time slices suitable for BPTT(h; h') (doi:10.1162/neco.1990.2.4.490),
+    where h = window_size, h' = step_size
+    - window_size >= step_size; for inference, set window_size = step_size
     - Intended for use as inner loop of DataBatchIter's loop
     - Use as
-          for input_step_tbi, target_step_tbi, time_t in TimeStepIter(args):
+          for input_step_tbi, target_step_tbi, time_t, \
+                  last_tap, loss_tap in TimeStepIter(args):
               (loop content)
-    - Upon each iteration, returns tuple of np.ndarray's and time signal
-          input     float32 [n_steps][batch_size][input_dim ],
-          target    float32 [n_steps][batch_size][target_dim],
+    - Upon each iteration, returns tuple of np.ndarray's and taps
+          input     float32 [n_steps][batch_size][input_dim ]
+          target    float32 [n_steps][batch_size][target_dim]
           time      float32 [n_steps]
+          last_tap  int     scan should return as update (tt.switch)
+                                last_tap == -1: prev_state
+                                otherwise     : state[last_tap]
+                            i.e., rewind states to last_tap after backprop
+          loss_tap  int     loss should be calculated in [loss_tap : n_steps]
     - Time starts at 0. and increases by 1. each step
-    - If first_step_hint is provided (for options['rolling_first_step']), 
-          first_step = step_size - (first_step_hint % step_size)
-      i.e., first_step rolls between 1 ~ step_size (by default fixed at step_size)
-    - Last iteration may not return n_steps == step_size
+    - Assuming a sufficiently long sequence,
+          First few: step_size <= n_steps <= window_size (increases by step_size)
+                     n_loss_frames = step_size (from right)
+          Middle   : n_steps = window_size
+                     n_loss_frames = step_size (from right)
+          Last     : window_size - step_size < n_steps <= window_size
+                     0 < n_loss_frames <= step_size (from right)
+    - For an insufficiently long sequece, slightly different but still functional
     """
     
-    def __init__(self, input_tbi, target_tbi, step_size, first_step_hint = 0):
+    def __init__(self, input_tbi, target_tbi, window_size, step_size):
         assert input_tbi.shape[0] == target_tbi.shape[0]
-        
-        self.input_tbi  = input_tbi
-        self.target_tbi = target_tbi
-        self.step_size  = step_size
-        self.first_step = step_size - (first_step_hint % step_size)
+        assert window_size >= step_size
+
+        self.input_tbi   = input_tbi
+        self.target_tbi  = target_tbi
+        self.step_size   = step_size
 
         self.all_timesteps = self.input_tbi.shape[0]
         self.time_idx = 0
+        self.wind_idx = step_size - window_size
 
     def __iter__(self):
         return self
@@ -144,11 +159,18 @@ class TimeStepIter():
         if self.time_idx >= self.all_timesteps:
             raise StopIteration()
         
-        n_steps = self.first_step if self.time_idx == 0 else self.step_size
-        next_idx = min(self.time_idx + n_steps, self.all_timesteps)
-        rng = range(self.time_idx, next_idx)
+        next_idx = min(self.time_idx + self.step_size, self.all_timesteps)
+        
+        shift = -min(0, self.wind_idx)
+        rng = range(self.wind_idx + shift, next_idx)
+
+        last_tap = min(max(0, self.step_size - shift) - 1, len(rng) - 1)
+        loss_tap = self.time_idx - rng[0]
+
+        self.wind_idx += self.step_size
         self.time_idx = next_idx
 
         return self.input_tbi[rng, :, :], \
                self.target_tbi[rng, :, :], \
-               np.array(rng).astype('float32')
+               np.array(rng).astype('float32'), \
+               last_tap, loss_tap

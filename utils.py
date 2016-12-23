@@ -13,6 +13,7 @@ import theano as th
 import theano.tensor as tt
 
 def MSE_loss(s_output_tbi, s_target_tbi):
+    # In Fractal, averaged in tb dimensions but not in i dimension
     return tt.mean(tt.sqr(s_output_tbi - s_target_tbi))
 
 # In the future, maybe add cross entropy loss, softmax activation, etc
@@ -33,7 +34,8 @@ def clip_elem(s_tensor, threshold):
         threshold > 0.
     """
     assert threshold > 0.
-    return tt.minimum(threshold, tt.maximum(-threshold, s_tensor))
+    # return tt.minimum(threshold, tt.maximum(-threshold, s_tensor))
+    return tt.clip(s_tensor, -threshold, threshold)
 
 # Weight initializers
 # Needs modification if used for ReLU or leaky ReLU nonlinearities:

@@ -54,7 +54,7 @@ class Layer():
         pass
     
     @abstractmethod
-    def setup_graph(self, s_below_tbj, s_time_t, v_params, v_prev_states):
+    def setup_graph(self, s_below_tbj, s_time_t, s_last_tap, v_params, v_prev_states):
         """
         Implements:
             Connect nodes below and global time node (if applicable) to outputs
@@ -62,12 +62,15 @@ class Layer():
         Inputs:
             s_below_tbj     symbolic    [n_steps][batch_size][n_in] (even if n_steps == 1)
             s_time_t        symbolic    [n_steps]                   (even if n_steps == 1)
+            s_last_tap      symbolic    int32 scalar (index)
             v_params        OrderedDict { str : th.SharedVariable }
             v_prev_states   OrderedDict { str : th.SharedVariable } (recurrent layers only)
         Returns:
             tuple of 
                 s_output_tbi, prev_state_update
-            where prev_state_update = (v_prev_state, s_new_prev_state)
+            where prev_state_update = (v_prev_state, s_next_prev_state)
+            with s_next_prev_state = v_prev_state       (if s_last_tap == -1)
+                                     state[s_last_tap]  (otherwise)
             Receiving side should check if prev_state_update is None before storing
         """
         pass
@@ -85,14 +88,23 @@ class Layer():
         y_bi = (x_bi - x_bi.mean(1)[:, None]) / tt.sqrt(x_bi.var(1)[:, None] + 1e-5)
         return s_i[None, :] * y_bi + b_i[None, :]
     
+    def layer_norm_lambdas(self, s_ci, b_ci, c, stride):
+        """
+            s_ci, b_ci  symbolic    [c * stride]
+        """
+        return [(lambda x_bi, i = i: \
+                      self.layer_norm(x_bi, self.slice1(s_ci, i, stride),  \
+                                            self.slice1(b_ci, i, stride))) \
+                 for i in range(c)] # i = i part due to Python 2.7 limitations
+
     def add_clock_params(self, params, n_out, options):
-        # t : period ~ exp(Uniform(lo, hi))
-        # s : shift  ~ Uniform(0, t)
-        params[self.pfx('t')] = np.exp(np.random.uniform(low  = options['clock_t_exp_lo'],
-                                                         high = options['clock_t_exp_hi'],
-                                                         size = (n_out))).astype('float32')
-        params[self.pfx('s')] = params[self.pfx('t')] * \
-                                np.random.uniform(size = (n_out)).astype('float32')
+        # clk_t : period ~ exp(Uniform(lo, hi))
+        # clk_s : shift  ~ Uniform(0, clk_t)
+        params[self.pfx('clk_t')] = np.exp(np.random.uniform(low  = options['clock_t_exp_lo'],
+                                                             high = options['clock_t_exp_hi'],
+                                                             size = (n_out))).astype('float32')
+        params[self.pfx('clk_s')] = params[self.pfx('clk_t')] * \
+                                    np.random.uniform(size = (n_out)).astype('float32')
         self.clock_r_on      = options['clock_r_on']
         self.clock_leak_rate = options['clock_leak_rate']
     
@@ -119,7 +131,7 @@ class FCLayer(Layer):
     def add_v_prev_state(self, v_prev_states):
         pass
     
-    def setup_graph(self, s_below_tbj, s_time_t, v_params, v_prev_states):
+    def setup_graph(self, s_below_tbj, s_time_t, s_last_tap, v_params, v_prev_states):
         return self._act(tt.dot(s_below_tbj, v_params[self.pfx('W')]) + \
                          v_params[self.pfx('b')]), None # no prev_state_update
 
@@ -161,7 +173,7 @@ class LSTMLayer(Layer):
         v_prev_states[self.pfx('prev')] = th.shared(np.zeros((self.batch_size, 2 * self.n_out)) \
                                                     .astype('float32'), name = self.pfx('prev'))
     
-    def setup_graph(self, s_below_tbj, s_time_t, v_params, v_prev_states):
+    def setup_graph(self, s_below_tbj, s_time_t, s_last_tap, v_params, v_prev_states):
         v_param = lambda name: v_params[self.pfx(name)]
 
         W_j4i = v_param('W')
@@ -169,9 +181,8 @@ class LSTMLayer(Layer):
         U_i4i = v_param('U')
         non_seqs = [U_i4i]
 
-        n_steps = s_below_tbj.shape[0] # can vary across th.function calls
-        n_batch = s_below_tbj.shape[1]
-        n_out   = U_i4i.shape[0]
+        n_steps = s_below_tbj.shape[0] # symbolic   (can vary across th.function calls)
+        n_out   = self.n_out           # int        (compile time constant)
 
         # options['lstm_peephole']
         if not self.use_peephole:
@@ -182,26 +193,19 @@ class LSTMLayer(Layer):
 
         # options['layer_norm']
         if not self.use_layer_norm:
-            thru = lambda x_bi: x_bi
-            l = [thru] * 4
+            l = [lambda x_bi: x_bi] * 4
         else:
-            l = [(lambda x_bi, i = i: \
-                      self.layer_norm(x_bi, self.slice1(v_param('ln_s'), i, n_out),  \
-                                            self.slice1(v_param('ln_b'), i, n_out))) \
-                 for i in range(4)] # i = i part due to Python 2.7 limitations
+            l = self.layer_norm_lambdas(v_param('ln_s'), v_param('ln_b'), 4, n_out)
             non_seqs.extend([v_param('ln_s'), v_param('ln_b')])
 
         # options['learn_clock_params']
         if s_time_t is None:
             mask_ti = tt.alloc(1., n_steps, 1) # will broadcast
         else: 
-            mask_ti = self.setup_clock_graph(s_time_t, v_param('t'), v_param('s'))
-        
-        below_tb4i = tt.dot(s_below_tbj, W_j4i) + b_4i
+            mask_ti = self.setup_clock_graph(s_time_t, v_param('clk_t'), v_param('clk_s'))
 
+        below_tb4i = tt.dot(s_below_tbj, W_j4i) + b_4i
         prev_state_b2i = v_prev_states[self.pfx('prev')]
-        prev_h_bi = prev_state_b2i[:, 0     : n_out    ]
-        prev_c_bi = prev_state_b2i[:, n_out : 2 * n_out]
 
         def step(mask_i, below_b4i, prev_h_bi, prev_c_bi, *args):
             preact_b4i = below_b4i + tt.dot(prev_h_bi, U_i4i) 
@@ -217,22 +221,22 @@ class LSTMLayer(Layer):
             h_bi = mask_i * h_bi + (1. - mask_i) * prev_h_bi 
 
             return h_bi, c_bi
-        
-        if n_steps == 1:
-            ret = step(mask_ti[0], below_tb4i[0], prev_h_bi, prev_c_bi)
-        else:
-            ret, _ = th.scan(step, sequences     = [mask_ti, below_tb4i],
-                                   outputs_info  = [prev_h_bi, prev_c_bi],
-                                   non_sequences = non_seqs,
-                                   n_steps       = n_steps,
-                                   name          = self.pfx('scan'),
-                                   strict        = True)
-        
-        h_tbi = ret[0].reshape((-1, n_batch, n_out))
-        c_tbi = ret[1].reshape((-1, n_batch, n_out))
 
-        return h_tbi, (v_prev_states[self.pfx('prev')], \
-                       tt.concatenate([h_tbi[-1], c_tbi[-1]], axis = 1))
+        ret, _ = th.scan(step, sequences     = [mask_ti, below_tb4i],
+                               outputs_info  = [self.slice2(prev_state_b2i, 0, n_out),
+                                                self.slice2(prev_state_b2i, 1, n_out)],
+                               non_sequences = non_seqs,
+                               n_steps       = n_steps,
+                               name          = self.pfx('scan'),
+                               strict        = True)
+        h_tbi = ret[0]
+        c_tbi = ret[1]
+
+        return h_tbi, \
+               (v_prev_states[self.pfx('prev')], \
+                    tt.switch(tt.eq(s_last_tap, -1), \
+                              v_prev_states[self.pfx('prev')], \
+                              tt.concatenate([h_tbi[s_last_tap], c_tbi[s_last_tap]], axis = 1)))
 
 
 class GRULayer(Layer):
@@ -268,7 +272,7 @@ class GRULayer(Layer):
         v_prev_states[self.pfx('prev')] = th.shared(np.zeros((self.batch_size, self.n_out)) \
                                                     .astype('float32'), name = self.pfx('prev'))
 
-    def setup_graph(self, s_below_tbj, s_time_t, v_params, v_prev_states):
+    def setup_graph(self, s_below_tbj, s_time_t, s_last_tap, v_params, v_prev_states):
         v_param = lambda name: v_params[self.pfx(name)]
 
         W_j2i = v_param('W')
@@ -279,30 +283,24 @@ class GRULayer(Layer):
         Uh_ii = v_param('Uh')
         non_seqs = [U_i2i, Uh_ii]
 
-        n_steps = s_below_tbj.shape[0] # can vary across th.function calls
-        n_batch = s_below_tbj.shape[1]
-        n_out   = U_i2i.shape[0]
+        n_steps = s_below_tbj.shape[0] # symbolic   (can vary across th.function calls)
+        n_out   = self.n_out           # int        (compile time constant)
 
         # options['layer_norm']
         if not self.use_layer_norm:
-            thru = lambda x_bi: x_bi
-            l = [thru] * 3
+            l = [lambda x_bi: x_bi] * 3
         else:
-            l = [(lambda x_bi, i = i: \
-                      self.layer_norm(x_bi, self.slice1(v_param('ln_s'), i, n_out),  \
-                                            self.slice1(v_param('ln_b'), i, n_out))) \
-                 for i in range(3)] # i = i part due to Python 2.7 limitations
+            l = self.layer_norm_lambdas(v_param('ln_s'), v_param('ln_b'), 3, n_out)
             non_seqs.extend([v_param('ln_s'), v_param('ln_b')])
 
         # options['learn_clock_params']
         if s_time_t is None:
             mask_ti = tt.alloc(1., n_steps, 1) # will broadcast
         else: 
-            mask_ti = self.setup_clock_graph(s_time_t, v_param('t'), v_param('s'))
-        
+            mask_ti = self.setup_clock_graph(s_time_t, v_param('clk_t'), v_param('clk_s'))
+
         below_tb2i = tt.dot(s_below_tbj, W_j2i) + b_2i
         belowh_tbi = tt.dot(s_below_tbj, Wh_ji) + bh_i
-        prev_h_bi  = v_prev_states[self.pfx('prev')]
 
         def step(mask_i, below_b2i, belowh_bi, prev_h_bi, *args):
             preact_b2i = below_b2i + tt.dot(prev_h_bi, U_i2i)
@@ -316,17 +314,16 @@ class GRULayer(Layer):
             h_bi = mask_i * h_bi + (1. - mask_i) * prev_h_bi
 
             return h_bi
-        
-        if n_steps == 1:
-            ret = step(mask_ti[0], below_tb2i[0], belowh_tbi[0], prev_h_bi)
-        else:
-            ret, _ = th.scan(step, sequences     = [mask_ti, below_tb2i, belowh_tbi],
-                                   outputs_info  = prev_h_bi,
-                                   non_sequences = non_seqs,
-                                   n_steps       = n_steps,
-                                   name          = self.pfx('scan'),
-                                   strict        = True)
-        
-        h_tbi = ret.reshape((-1, n_batch, n_out))
 
-        return h_tbi, (v_prev_states[self.pfx('prev')], h_tbi[-1])
+        h_tbi, _ = th.scan(step, sequences     = [mask_ti, below_tb2i, belowh_tbi],
+                                 outputs_info  = v_prev_states[self.pfx('prev')],
+                                 non_sequences = non_seqs,
+                                 n_steps       = n_steps,
+                                 name          = self.pfx('scan'),
+                                 strict        = True)
+
+        return h_tbi, \
+               (v_prev_states[self.pfx('prev')], \
+                    tt.switch(tt.eq(s_last_tap, -1), \
+                              v_prev_states[self.pfx('prev')], \
+                              h_tbi[s_last_tap]))

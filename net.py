@@ -72,8 +72,8 @@ class Net():
             with open(load_from + '/options.pkl', 'rb') as f:
                 self._options = pk.load(f)
             
-            if options is not None and 'batch_size' in options:
-                self._options['batch_size'] = options['batch_size']
+            assert 'batch_size' in options
+            self._options['batch_size'] = options['batch_size']
  
     def _init_params(self, load_from):
         """
@@ -149,15 +149,14 @@ class Net():
                 self._v_grads_for_init = [th.shared(v.get_value() * 0., name = k + '_grad') \
                                           for k, v in self._v_prev_states.iteritems()]
 
-    def _setup_forward_graph(self, s_input_tbi, s_time_t, s_id_idx_b, v_params, v_prev_states):
+    def _setup_forward_graph(self, s_input_tbi, s_time_t, s_id_idx_b,
+                             s_last_tap, v_params, v_prev_states):
         """
         Specify layer connections
         Layers return their final internal states (to be used for the next time sequence) as
             prev_state_update = (v_prev_state, s_new_prev_state)
         which are collected as a list and returned along with the last layer's output
         """
-        prev_state_updates = []
-
         if not self._options['learn_id_embedding']:
             cat = lambda s_below_tbj: s_below_tbj
         else:
@@ -165,6 +164,7 @@ class Net():
                 setup_graph(s_below_tbj   = tt.extra_ops.to_one_hot \
                                                 (s_id_idx_b, self._options['id_count']),
                             s_time_t      = None,
+                            s_last_tap    = s_last_tap,
                             v_params      = v_params,
                             v_prev_states = v_prev_states)
             s_id_emb_tbi = tt.tile(s_id_emb_bi, (s_input_tbi.shape[0], 1, 1))
@@ -173,12 +173,14 @@ class Net():
         D = self._options['net_depth']
         s_outputs = [None] * (D + 1)  # (RNN) * D + FC
         s_outputs.append(s_input_tbi) # put input at index -1
+        prev_state_updates = []
 
         # vertical stack: input -> layer[0] -> ... -> layer[D - 1] -> output
         for i in range(D + 1):
             s_outputs[i], update = self._layers[i]. \
                 setup_graph(s_below_tbj   = cat(s_outputs[i - 1]),
                             s_time_t      = s_time_t if self._options['learn_clock_params'] else None,
+                            s_last_tap    = s_last_tap,
                             v_params      = v_params,
                             v_prev_states = v_prev_states)
             if update is not None:
@@ -189,25 +191,29 @@ class Net():
     def _setup_inference_graph(self):
         """
         Connect graphs together for inference and store input/output ports and updates
-        Input port : _port_i_input, _port_i_time, _port_i_id_idx
-        Output port: _port_o_output
-        Updates    : _prev_state_updates
+            Input port : _port_i_input, _port_i_time, _port_i_id_idx
+            Output port: _port_o_output
+            Updates    : _prev_state_updates
         """
-        self._port_i_input_tbi = tt.tensor3(name = 'port_i_input' , dtype='float32')
-        self._port_i_time_t    = tt.vector (name = 'port_i_time'  , dtype='float32')
-        self._port_i_id_idx_b  = tt.vector (name = 'port_i_id_idx', dtype='int32'  )
+        self._port_i_input_tbi = tt.tensor3(name  = 'port_i_input' , dtype = 'float32')
+        self._port_i_time_t    = tt.vector (name  = 'port_i_time'  , dtype = 'float32')
+        self._port_i_id_idx_b  = tt.vector (name  = 'port_i_id_idx', dtype = 'int32'  )
+        
+        s_last_tap = self._port_i_input_tbi.shape[0] - 1 # always fixed at last step
+
         self._port_o_output, self._prev_state_updates = \
                            self._setup_forward_graph(s_input_tbi   = self._port_i_input_tbi,
                                                      s_time_t      = self._port_i_time_t,
                                                      s_id_idx_b    = self._port_i_id_idx_b,
+                                                     s_last_tap    = s_last_tap,
                                                      v_params      = self._v_params,
                                                      v_prev_states = self._v_prev_states)
 
-    def _setup_loss_graph(self, s_output_tbi, s_target_tbi):
+    def _setup_loss_graph(self, s_output_tbi, s_target_tbi, s_loss_tap):
         """
         Connect a loss function to the graph
         """
-        return MSE_loss(s_output_tbi, s_target_tbi)
+        return MSE_loss(s_output_tbi[s_loss_tap :], s_target_tbi[s_loss_tap :])
 
     def _setup_grad_updates_graph(self, s_loss, v_wrt, v_grads):
         """
@@ -215,6 +221,7 @@ class Net():
             grad_update = (v_grad, s_new_grad)
         Takes inputs as lists instead of OrderedDict
         """
+        assert len(v_wrt) == len(v_grads)
         s_new_grads = tt.grad(s_loss, wrt = v_wrt)
         if 'grad_norm_clip' in self._options:
             s_new_grads = [clip_norm(s_grad, self._options['grad_norm_clip']) \
@@ -230,10 +237,12 @@ class Net():
         Takes inputs as lists instead of OrderedDict
         Assumes that v_grads has been updated prior to applying param_updates returned here
         """
+        assert len(v_params) == len(v_grads)
         optim_f_inits, optim_f_updates, s_forces = \
             eval(self._options['force_type'] + '_force')(options = self._options,
                                                          s_lr    = s_lr,
                                                          v_grads = v_grads)
+        assert len(v_params) == len(s_forces)
         optim_u_inits, optim_u_param_updates = \
             eval(self._options['update_type'] + '_update')(options  = self._options,
                                                            v_params = v_params,
@@ -243,25 +252,30 @@ class Net():
     def _setup_training_graph(self):
         """
         Connect graphs together for training and store input/output ports and updates
-        Input ports: _port_i_input, _port_i_target, _port_i_time, _port_i_id_idx_b, _port_i_lr, 
+        Input ports: _port_i_input, _port_i_target, _port_i_time, _port_i_id_idx_b,
+                     _port_i_last_tap, _port_i_loss_tap, _port_i_lr, 
         Output port: _port_o_loss
         Updates    : _prev_state_updates, _grad_updates, _optim_state_inits, _param_updates
         """
-        self._port_i_input_tbi  = tt.tensor3(name = 'port_i_input' , dtype='float32')
-        self._port_i_target_tbi = tt.tensor3(name = 'port_i_target', dtype='float32')
-        self._port_i_time_t     = tt.vector (name = 'port_i_time'  , dtype='float32')
-        self._port_i_id_idx_b   = tt.vector (name = 'port_i_id_idx', dtype='int32'  )
-        self._port_i_lr         = tt.scalar (name = 'port_i_lr'    , dtype='float32')
+        self._port_i_input_tbi  = tt.tensor3(name = 'port_i_input'   , dtype = 'float32')
+        self._port_i_target_tbi = tt.tensor3(name = 'port_i_target'  , dtype = 'float32')
+        self._port_i_time_t     = tt.vector (name = 'port_i_time'    , dtype = 'float32')
+        self._port_i_id_idx_b   = tt.vector (name = 'port_i_id_idx'  , dtype = 'int32'  )
+        self._port_i_last_tap   = tt.scalar (name = 'port_i_last_tap', dtype = 'int32'  )
+        self._port_i_loss_tap   = tt.scalar (name = 'port_i_loss_tap', dtype = 'int32'  )
+        self._port_i_lr         = tt.scalar (name = 'port_i_lr'      , dtype = 'float32')
 
         s_output_tbi, self._prev_state_updates = \
                            self._setup_forward_graph(s_input_tbi   = self._port_i_input_tbi,
                                                      s_time_t      = self._port_i_time_t,
                                                      s_id_idx_b    = self._port_i_id_idx_b,
+                                                     s_last_tap    = self._port_i_last_tap,
                                                      v_params      = self._v_params,
                                                      v_prev_states = self._v_prev_states)
 
         self._port_o_loss = self._setup_loss_graph(s_output_tbi = s_output_tbi,
-                                                   s_target_tbi = self._port_i_target_tbi)
+                                                   s_target_tbi = self._port_i_target_tbi,
+                                                   s_loss_tap   = self._port_i_loss_tap)
 
         self._grad_updates  = self._setup_grad_updates_graph (s_loss   = self._port_o_loss,
                                                               v_wrt    = self._v_params_wo_init.values(),
@@ -308,26 +322,30 @@ class Net():
     def compile_f_fwd_propagate(self):
         """
         Compile a callable object of signature
-            f(input_tbi, target_tbi, time_t, id_idx_b) -> loss (for training)
-            f(input_tbi, time_t, id_idx_b) -> output_tbi       (for inference)
+            f(input_tbi, target_tbi, time_t,
+              id_idx_b, last_tap, loss_tap) -> loss         (for training)
+            f(input_tbi, time_t, id_idx_b)  -> output_tbi   (for inference)
         As a side effect, calling it updates
             _v_prev_states <- _prev_state_updates
         Note that output is a list of np.ndarray (i.e., 0-th element is np.ndarray)
         """
         if self._is_training:
             return th.function(inputs  = [self._port_i_input_tbi, self._port_i_target_tbi,
-                                          self._port_i_time_t   , self._port_i_id_idx_b],
+                                          self._port_i_time_t   , self._port_i_id_idx_b,
+                                          self._port_i_last_tap , self._port_i_loss_tap],
                                outputs = [self._port_o_loss],
                                updates = self._prev_state_updates,
                        on_unused_input = 'raise' if self._options['learn_clock_params'] \
-                                         else 'ignore')
+                                                 or self._options['learn_id_embedding'] \
+                                                 else 'ignore')
         else:
             return th.function(inputs  = [self._port_i_input_tbi, self._port_i_time_t,
                                           self._port_i_id_idx_b],
                                outputs = [self._port_o_output],
                                updates = self._prev_state_updates,
                        on_unused_input = 'raise' if self._options['learn_clock_params'] \
-                                         else 'ignore')
+                                                 or self._options['learn_id_embedding'] \
+                                                 else 'ignore')
 
     def compile_f_fwd_bwd_propagate(self):
         """
@@ -341,11 +359,13 @@ class Net():
         """
         assert self._is_training
         return th.function(inputs  = [self._port_i_input_tbi, self._port_i_target_tbi,
-                                      self._port_i_time_t   , self._port_i_id_idx_b],
+                                      self._port_i_time_t   , self._port_i_id_idx_b,
+                                      self._port_i_last_tap , self._port_i_loss_tap],
                            outputs = [self._port_o_loss],
                            updates = self._grad_updates + self._prev_state_updates,
                            on_unused_input = 'raise' if self._options['learn_clock_params'] \
-                                        else 'ignore')
+                                                     or self._options['learn_id_embedding'] \
+                                                     else 'ignore')
     
     def compile_f_update_v_params(self):
         """
@@ -368,12 +388,14 @@ class Net():
         """
         assert self._is_training and self._options['learn_init_states']
         return th.function(inputs  = [self._port_i_input_tbi, self._port_i_target_tbi,
-                                      self._port_i_time_t   , self._port_i_id_idx_b],
+                                      self._port_i_time_t   , self._port_i_id_idx_b,
+                                      self._port_i_last_tap , self._port_i_loss_tap],
                            outputs = [self._port_o_loss],
                            updates = self._grad_updates + self._prev_state_updates + \
                                      self._grad_updates_for_init,
                            on_unused_input = 'raise' if self._options['learn_clock_params'] \
-                                        else 'ignore')
+                                                     or self._options['learn_id_embedding'] \
+                                                     else 'ignore')
     
     def compile_f_update_init_states(self):
         """

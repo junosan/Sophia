@@ -66,7 +66,8 @@ def momentum_update(options, v_params, s_forces):
 
 def nesterov_update(options, v_params, s_forces):
     """
-    Same as above, but with external_force at lookahead position (arXiv:1212.0901 Eqs 6,7)
+    Same as above, but with external_force at lookahead position
+    (in terms of peeked-ahead params; arXiv:1212.0901 Eqs 6,7)
         x -= mu v
         v = mu v + external_force
         x += (1. + mu) v
@@ -115,8 +116,8 @@ def adadelta_force(options, s_lr, v_grads):
     s_forces = []
 
     for v_grad in v_grads:
-        # do not re-initialize denominator variable
         v_grad_ms = th.shared(np.ones_like(v_grad.get_value())) # modded 0 init -> 1 init
+        inits.append((v_grad_ms, tt.ones_like(v_grad_ms)))
         
         v_force_ms = th.shared(np.zeros_like(v_grad.get_value()))
         inits.append((v_force_ms, tt.zeros_like(v_force_ms)))
@@ -149,8 +150,8 @@ def rmsprop_force(options, s_lr, v_grads):
     s_forces = []
 
     for v_grad in v_grads:
-        # do not re-initialize denominator variable
         v_grad_ms = th.shared(np.ones_like(v_grad.get_value())) # modded 0 init -> 1 init
+        inits.append((v_grad_ms, tt.ones_like(v_grad_ms)))
 
         s_new_grad_ms = rho * v_grad_ms + (1. - rho) * tt.sqr(v_grad)
 

@@ -32,10 +32,10 @@ def main():
     options['net_width']          = 1024
     options['net_depth']          = 4
     options['batch_size']         = 64
-    options['step_size']          = 128
+    options['window_size']        = 128
+    options['step_size']          = 64
     options['init_scale']         = 0.02
     options['init_use_ortho']     = False
-    options['rolling_first_step'] = True
     options['learn_init_states']  = False
     options['layer_norm']         = False
     options['learn_clock_params'] = False
@@ -133,35 +133,44 @@ def main():
         frames = []
         frames_seen = 0
         finished = False
+
         for input_tbi, target_tbi, id_idx_b, batch_idx in data_iter:
             f_initialize_states()
-            for input_step_tbi, target_step_tbi, time_t in \
-                    TimeStepIter(input_tbi       = input_tbi,
-                                 target_tbi      = target_tbi,
-                                 step_size       = options['step_size'],
-                                 first_step_hint = batch_idx if options['rolling_first_step'] \
-                                                   else 0):
+
+            for input_step_tbi, target_step_tbi, time_t, last_tap, loss_tap in \
+                    TimeStepIter(input_tbi   = input_tbi,
+                                 target_tbi  = target_tbi,
+                                 window_size = options['window_size'] if lr_cur is not None else \
+                                               options['step_size'],
+                                 step_size   = options['step_size']):
                 if lr_cur is not None:
-                    if options['learn_init_states'] and time_t[0] == 0:
-                        loss = f_fwd_bwd_for_init(input_step_tbi, target_step_tbi, time_t, id_idx_b)
+                    if options['learn_init_states'] and time_t[0] == np.float32(0):
+                        loss = f_fwd_bwd_for_init(input_step_tbi, target_step_tbi, time_t,
+                                                  id_idx_b, last_tap, loss_tap)
                     else:
-                        loss = f_fwd_bwd_propagate(input_step_tbi, target_step_tbi, time_t, id_idx_b)
+                        loss = f_fwd_bwd_propagate(input_step_tbi, target_step_tbi, time_t,
+                                                   id_idx_b, last_tap, loss_tap)
                 else:
-                    loss = f_fwd_propagate(input_step_tbi, target_step_tbi, time_t, id_idx_b)
+                    loss = f_fwd_propagate(input_step_tbi, target_step_tbi, time_t,
+                                           id_idx_b, last_tap, loss_tap)
+                
                 losses.append(np.asscalar(loss[0])) 
-                frame = input_step_tbi.shape[0] * input_step_tbi.shape[1]
+                frame = (input_step_tbi.shape[0] - loss_tap) * input_step_tbi.shape[1]
                 frames.append(frame)
                 frames_seen += frame
+                
                 if lr_cur is not None:
                     f_update_v_params(lr_cur)
-                    if options['learn_init_states'] and time_t[0] == 0:
+                    if options['learn_init_states'] and time_t[0] == np.float32(0):
                         f_update_init_states(lr_cur)
+                
                 if frames_seen >= options['frames_per_epoch']:
                     finished = True
                     break
             if finished:
                 break
-        return np.sum(np.array(losses) * np.array(frames)) / float(frames_seen), frames_seen
+        return np.sum(np.array(losses) * np.array(frames) / frames_seen).astype('float32'), \
+               frames_seen
     
 
     """
