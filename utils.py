@@ -12,9 +12,12 @@ import numpy as np
 import theano as th
 import theano.tensor as tt
 
-def MSE_loss(s_output_tbi, s_target_tbi):
-    # In Fractal, averaged in tb dimensions but not in i dimension
-    return tt.mean(tt.sqr(s_output_tbi - s_target_tbi))
+def SE_loss(s_output_tbi, s_target_tbi):
+    # To match Fractal:
+    #     use SE rather than MSE
+    #     average in tb dimensions (but not in i dimension) for display
+    #     factor of 1 / 2 (removed after testing)
+    return tt.sum(tt.sqr(s_output_tbi - s_target_tbi))
 
 # In the future, maybe add cross entropy loss, softmax activation, etc
 
@@ -79,7 +82,8 @@ def xavier_weight(n_in, n_out):
     """
     r = np.sqrt(6.) / np.sqrt(n_in + n_out)
     W = np.random.rand(n_in, n_out) * 2 * r - r
-    # np.random.rand ~ Uniform [0, 1); Gaussian is also possible -- see above reference
+    # np.random.rand ~ Uniform [0, 1)
+    # Gaussian is also possible -- see above reference
     return W.astype('float32')
 
 
@@ -87,5 +91,7 @@ import string
 import random
 
 def get_random_string(length = 8):
-    return ''.join(random.SystemRandom().choice( \
-        string.ascii_uppercase + string.ascii_lowercase + string.digits) for _ in range(length))
+    return ''.join(random.SystemRandom().choice(string.ascii_uppercase
+                                                + string.ascii_lowercase
+                                                + string.digits) \
+                   for _ in range(length))

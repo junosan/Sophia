@@ -5,7 +5,7 @@
 #==========================================================================#
 
 """
-Script for real time inference via ZeroMQ IPC with Sibyl
+Script for real time inference via ZeroMQ IPC with an external agent
 """
 
 import zmq
@@ -15,9 +15,9 @@ from ensemble import Ensemble
 def main():
     context = zmq.Context()
     socket = context.socket(zmq.REP)
-    socket.bind("ipc:///tmp/sophia_sibyl")
+    socket.bind("ipc:///tmp/sophia_ipc")
 
-    # First msg:
+    # first msg:
     #     'workspace_0;...;workspace_(N-1);batch_size
     #      idx_0;...;idx_(B-1)  (for workspace 0)
     #      ...
@@ -47,7 +47,7 @@ def main():
         msg = socket.recv()
         inp = np.frombuffer(msg, dtype = '<f4')
 
-        # Sibyl signals end by sending one std::nanf("")
+        # signal end by sending one std::nanf("")
         if np.isnan(inp[0]):
             break
 

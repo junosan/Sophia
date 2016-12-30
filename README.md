@@ -15,30 +15,22 @@ loosely correlated target.
 
 ## Prerequisites
 - Theano (developed on 0.9.0.dev4-py2.7): follow through their installation instructions using Miniconda, along with the bleeding-edge installation & latest version of libgpuarray
-
+- Input and target data preprocessed and saved as separate binary files ([timesteps][dimensions] order)
 
 ## Options
-- input_dim, target_dim : 44, 1
-- unit_type             : 'LSTM'
-- net_width, net_depth  : complexity ~ W<sup>2</sup> D
-- batch_size            : 64
-- step_size             : 128
-- rolling_first_step    : True
-- learn_init_states     : False
-- layer_norm            : False ([arXiv:1607.06450](https://arxiv.org/abs/1607.06450))
-- learn_clock_params    : False ([arXiv:1610.09513](https://arxiv.org/abs/1610.09513))
-- clock_t_exp_lo        : 1
-- clock_t_exp_hi        : 6
-- clock_r_on            : 0.2
-- clock_leak_rate       : 0.001
-- optimizer             : 'adam'
-- grad_clip             : 2.
-- lr_init_val           : 0.001
-- lr_lower_bound        : 0.00001
-- lr_decay_rate         : 0.5
-- max_retry             : 10
-- frames_per_epoch      : 8 * 1024 * 1024
-
+- input_dim, target_dim  : currently set to 44, 1
+- unit_type              : 'FC'/'LSTM'/'GRU'/'PILSTM'
+- net_width, net_depth   : # of params ~ W<sup>2</sup> D
+- batch_size             : minibatch size
+- window_size, step_size : for BPTT(h; h') (doi:10.1162/neco.1990.2.4.490)
+- learn_init_states      : False/True
+- layer_norm             : False/True ([arXiv:1607.06450](https://arxiv.org/abs/1607.06450); modified version of)
+- skip_connection        : False/True ([arXiv:1611.01260](https://arxiv.org/abs/1611.01260))
+- learn_clock_params     : False/True ([arXiv:1610.09513](https://arxiv.org/abs/1610.09513))
+- update_type            : 'sgd'/'momentum'/'nesterov'
+- optimizer              : 'vanilla'/'adadelta'/'rmsprop'/'adam'
+- frames_per_epoch       : timesteps * batch_size per epoch
+- lr_init_val, lr_lower_bound, lr_decay_rate, max_retry : for annealing
 
 # Code reference
 
@@ -50,7 +42,7 @@ loosely correlated target.
 |    v_     |th.SharedVariable|variable on GPU memory; has init value                                            |th.shared                                                            |
 |    s_     |  symbolic node  |graph node; has no substance until compiled                                       |tensor literals (tt.alloc, etc)   <br> calculations on v_/s_         |
 |port_<i/o>_|  symbolic node  |same as above, but marked for use as       <br> input/output ports for th.function|inputs: tt.scalar, tt.matrix, etc <br> outputs: calculations on v_/s_|
-|    f_     |callable object  |links built-in/NumPy to input/output ports <br> all v_ updates take place via f_  |th.function                                                          |
+|    f_     | callable object |links built-in/NumPy to input/output ports <br> all v_ updates take place via f_  |th.function                                                          |
 
 * th = theano, tt = theano.tensor
 * Prefix not used inside Layer.setup_graph as there is no need for distinction there
@@ -58,11 +50,11 @@ loosely correlated target.
 <br>
 
 
-|         suffix          |              explanation              |        
-|:-----------------------:|:-------------------------------------:|
-|<tensor_name>_[t][b][i/j]|[time][batch][hidden] dimensions       |
-|   <individual_name>s    |collections (list, dict, etc)          |
-|   <any_name>_for_init   |related to options['learn_init_states']|
+|          suffix           |              explanation              |        
+|:-------------------------:|:-------------------------------------:|
+|<tensor_name>_[t][b][i/j/k]|[time][batch][hidden] dimensions       |
+|    <individual_name>s     |collections (list, dict, etc)          |
+|    <any_name>_for_init    |related to options['learn_init_states']|
 
 ` [optional], <required>, {default}, (miscellaneous) `
 
@@ -109,12 +101,10 @@ loosely correlated target.
 
 
 ## TODO
-Try to reproduce Fractal results first
-- [testing] Peephole LSTM
-- [testing] Uniform init instead of ortho ('init_use_ortho', 'init_scale', initializers take both 1D/2D shape and options directly)
-- [testing] Other optimizers (AdaDelta, RMSProp, SGD/Nesterov -- see Fractal); no AdaGrad
-- ID embedding; one hot ID -> Linear FC (of smaller dim) and add as input_bi to each layer; use tt.to_one_hot 
+- Unroll (https://yjk21.github.io/unrolling.html)
+- Simple skip gate (h = h * sig(k) + x * (1. - sig(k)); with k [n_out] initialized negative)
 - Reinforcement learning
+- Generalize to inequal length sequences (reset signal instead of f_initialize_states)
 
 ## Miscellaneous notes
 * [SliceableOrderedDict](http://stackoverflow.com/questions/30975339/slicing-a-python-ordereddict)

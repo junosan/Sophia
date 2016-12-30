@@ -6,10 +6,14 @@
 
 """
 Optimizers
-    optim_f_inits, optim_f_updates, s_forces       = force_func (options, s_lr    , v_grads )
-    optim_u_inits, optim_u_updates + param_updates = update_func(options, v_params, s_forces)
+    optim_f_inits, optim_f_updates, s_forces \
+        = force_func (options, s_lr    , v_grads )
+    optim_u_inits, optim_u_updates + param_updates \
+        = update_func(options, v_params, s_forces)
+
     to f_initialize_optimizer : optim_f_inits + optim_u_inits
-    to f_update_v_params      : optim_f_updates + optim_u_updates + param_updates
+    to f_update_v_params      : optim_f_updates + optim_u_updates
+                                + param_updates
 Note:
     v_params & v_grads must be lists of same shape & order
     v_grads must be updated before applying updates returned here
@@ -22,8 +26,8 @@ import theano.tensor as tt
 from utils import clip_elem
 
 """
-Update functions to define increment for parameters, treating gradient
-as a force along a potential hill with friction (unit mass & unit time step implied)
+Update functions to define increment for parameters, treating gradient as a
+force along a potential hill with friction (unit mass & unit time step implied)
     v += - (1 - mu) v + external_force
 where
     (1 - mu)      : dimensionless Stokes friction
@@ -40,7 +44,8 @@ def sgd_update(options, v_params, s_forces):
     (i.e., discrete version of critical damping)
         x += external_force
     """
-    return [], [(v_param, v_param + s_force) for v_param, s_force in zip(v_params, s_forces)]
+    return [], [(v_param, v_param + s_force) \
+                for v_param, s_force in zip(v_params, s_forces)]
 
 def momentum_update(options, v_params, s_forces):
     """
@@ -90,7 +95,9 @@ def nesterov_update(options, v_params, s_forces):
 
 
 """
-Force functions to define increment for velocity (external_force excluding friction)
+Force functions to define increment for velocity
+(i.e., external_force excluding friction)
+
 Implement the following signature:
     f(options, s_lr, v_grads) -> optim_f_inits, optim_f_updates, s_forces
 """
@@ -106,7 +113,8 @@ def adadelta_force(options, s_lr, v_grads):
     Originally from: arXiv:1212.5701
     Modifications  : https://github.com/KyuyeonHwang/Fractal
     """
-    # Hyperparameters from Fractal are rho = 0.99, e = 1e-20, clip = sqrt(1 / (1 - rho))
+    # Hyperparameters from Fractal are
+    # rho = 0.99, e = 1e-20, clip = sqrt(1 / (1 - rho))
     rho  = options['force_ms_decay']
     e    = 1e-20
     clip = np.sqrt(1. / (1. - rho)).astype('float32') # 10.
@@ -116,7 +124,8 @@ def adadelta_force(options, s_lr, v_grads):
     s_forces = []
 
     for v_grad in v_grads:
-        v_grad_ms = th.shared(np.ones_like(v_grad.get_value())) # modded 0 init -> 1 init
+        # modded 0 init -> 1 init
+        v_grad_ms = th.shared(np.ones_like(v_grad.get_value()))
         inits.append((v_grad_ms, tt.ones_like(v_grad_ms)))
         
         v_force_ms = th.shared(np.zeros_like(v_grad.get_value()))
@@ -124,8 +133,9 @@ def adadelta_force(options, s_lr, v_grads):
 
         s_new_grad_ms = rho * v_grad_ms + (1. - rho) * tt.sqr(v_grad)
         
-        s_force = -tt.sqrt(v_force_ms + tt.sqr(s_lr)) * \
-                  clip_elem(v_grad / (tt.sqrt(s_new_grad_ms) + e), clip) # modded s_lr**2, clip
+        # modded s_lr**2, clip_elem
+        s_force = -(tt.sqrt(v_force_ms + tt.sqr(s_lr))
+                    * clip_elem(v_grad / (tt.sqrt(s_new_grad_ms) + e), clip))
 
         s_new_force_ms = rho * v_force_ms + (1. - rho) * tt.sqr(s_force)
 
@@ -137,10 +147,12 @@ def adadelta_force(options, s_lr, v_grads):
 
 def rmsprop_force(options, s_lr, v_grads):
     """
-    Originally from: http://www.cs.toronto.edu/~tijmen/csc321/slides/lecture_slides_lec6.pdf
+    Originally from: http://www.cs.toronto.edu/~tijmen/csc321
+                           /slides/lecture_slides_lec6.pdf
     Modifications  : https://github.com/KyuyeonHwang/Fractal
     """
-    # Hyperparameters from Fractal are rho = 0.99, e = 1e-20, clip = sqrt(1 / (1 - rho))
+    # Hyperparameters from Fractal are
+    # rho = 0.99, e = 1e-20, clip = sqrt(1 / (1 - rho))
     rho  = options['force_ms_decay']
     e    = 1e-20
     clip = np.sqrt(1. / (1. - rho)).astype('float32') # 10.
@@ -150,12 +162,15 @@ def rmsprop_force(options, s_lr, v_grads):
     s_forces = []
 
     for v_grad in v_grads:
-        v_grad_ms = th.shared(np.ones_like(v_grad.get_value())) # modded 0 init -> 1 init
+        # modded 0 init -> 1 init
+        v_grad_ms = th.shared(np.ones_like(v_grad.get_value()))
         inits.append((v_grad_ms, tt.ones_like(v_grad_ms)))
 
         s_new_grad_ms = rho * v_grad_ms + (1. - rho) * tt.sqr(v_grad)
 
-        s_forces.append(-s_lr * clip_elem(v_grad / (tt.sqrt(s_new_grad_ms) + e), clip)) # modded clip
+        # modded clip_elem
+        s_forces.append \
+            (-s_lr * clip_elem(v_grad / (tt.sqrt(s_new_grad_ms) + e), clip))
         updates.append((v_grad_ms, s_new_grad_ms))
     
     return inits, updates, s_forces
@@ -164,7 +179,8 @@ def adam_force(options, s_lr, v_grads):
     """
     Originally from: arXiv:1412.6980
     """
-    # Hyperparameters recommended in paper are b1 = 0.9, b2 = 0.999, e = 1e-8
+    # Hyperparameters recommended in paper are
+    # b1 = 0.9, b2 = 0.999, e = 1e-8
     b1 = options['force_adam_b1'] 
     b2 = options['force_adam_b2']
     e  = 1e-8
@@ -180,11 +196,11 @@ def adam_force(options, s_lr, v_grads):
     s_calibrated_lr = s_lr * tt.sqrt(1. - b2**(s_new_t)) / (1. - b1**(s_new_t))
 
     for v_grad in v_grads:
-        v_m = th.shared(np.zeros_like(v_grad.get_value())) # th.shared(tt -> np 0-tensor)
+        v_m = th.shared(np.zeros_like(v_grad.get_value()))
         inits.append((v_m, tt.zeros_like(v_m)))
         
         v_v = th.shared(np.zeros_like(v_grad.get_value()))
-        inits.append((v_v, tt.zeros_like(v_v))) # also initialize as it's calibrated
+        inits.append((v_v, tt.zeros_like(v_v)))
 
         s_new_m = b1 * v_m + (1. - b1) * v_grad
         s_new_v = b2 * v_v + (1. - b2) * tt.sqr(v_grad)

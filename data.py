@@ -29,9 +29,8 @@ def build_id_idx(list_file):
 
 class DataBatchIter():
     """
-    - Use as
-          for input_tbi, target_tbi, id_idx_b, batch_idx in DataBatchIter(args):
-              (loop content)
+    - for input_tbi, target_tbi, id_idx_b, batch_idx in DataBatchIter(args):
+          (loop content)
     - Upon each iteration, returns tuple of np.ndarray's and batch_idx
           input     float32 [all_timesteps][batch_size][input_dim ]
           target    float32 [all_timesteps][batch_size][target_dim]
@@ -44,7 +43,7 @@ class DataBatchIter():
     """
 
     def __init__(self, list_file, input_dim, target_dim, batch_size, id_idx):
-        self.data_root  = list_file[:list_file.rfind('/') + 1] # path including /
+        self.data_root  = list_file[: list_file.rfind('/') + 1] # includes /
         self.input_dim  = input_dim
         self.target_dim = target_dim
         self.batch_size = batch_size
@@ -59,9 +58,11 @@ class DataBatchIter():
         
         # '<f4' means little endian, float, 4 bytes
         #     https://docs.scipy.org/doc/numpy/reference/arrays.dtypes.html
-        input_ti = np.fromfile(self.data_root + self.seqs[0] + '.input', dtype = '<f4') \
-                     .reshape((-1, input_dim ))         # ^ deterministic index 0 here
-        self.all_timesteps = input_ti.shape[0] # all files will be checked against this length
+        input_ti = np.fromfile(self.data_root + self.seqs[0] + '.input',
+                               dtype = '<f4').reshape((-1, input_dim ))
+        
+        # all files checked against this length (for now)
+        self.all_timesteps = input_ti.shape[0]
 
         self.batch_idx = 0
         self.reset_seq_order()
@@ -71,7 +72,7 @@ class DataBatchIter():
 
     def reset_seq_order(self):
         self.seq_idx = 0
-        self.seq_order = np.random.permutation(self.n_seqs) # permuted version of np.arange(#)
+        self.seq_order = np.random.permutation(self.n_seqs) # of np.arange(n)
     
     def seq(self, seq_idx):
         return self.seqs[self.seq_order[seq_idx]]
@@ -81,9 +82,9 @@ class DataBatchIter():
         Returns tuple of np.ndarray's
             [all_timesteps][input_dim], [all_timesteps][target_dim]
         """
-        input_ti  = np.fromfile(self.data_root + self.seq(seq_idx) + '.input' , \
+        input_ti  = np.fromfile(self.data_root + self.seq(seq_idx) + '.input' ,
                                 dtype = '<f4').reshape((-1, self.input_dim ))
-        target_ti = np.fromfile(self.data_root + self.seq(seq_idx) + '.target', \
+        target_ti = np.fromfile(self.data_root + self.seq(seq_idx) + '.target',
                                 dtype = '<f4').reshape((-1, self.target_dim))
 
         assert input_ti .shape[0] == self.all_timesteps
@@ -92,8 +93,12 @@ class DataBatchIter():
         return input_ti, target_ti
 
     def next(self):
-        input_tbi  = np.zeros((self.all_timesteps, self.batch_size, self.input_dim )).astype('float32')
-        target_tbi = np.zeros((self.all_timesteps, self.batch_size, self.target_dim)).astype('float32')
+        input_tbi  = np.zeros \
+                     ((self.all_timesteps, self.batch_size, self.input_dim )) \
+                     .astype('float32')
+        target_tbi = np.zeros \
+                     ((self.all_timesteps, self.batch_size, self.target_dim)) \
+                     .astype('float32')
         id_idx_b   = np.zeros(self.batch_size).astype('int32')
         
         for b in range(self.batch_size):
@@ -112,8 +117,8 @@ class DataBatchIter():
 
 class TimeStepIter():
     """
-    Creates time slices suitable for BPTT(h; h') (doi:10.1162/neco.1990.2.4.490),
-    where h = window_size, h' = step_size
+    Creates time slices suitable for BPTT(h; h'), where
+        h = window_size, h' = step_size (doi:10.1162/neco.1990.2.4.490)
     - window_size >= step_size; for inference, set window_size = step_size
     - Intended for use as inner loop of DataBatchIter's loop
     - Use as
@@ -131,13 +136,15 @@ class TimeStepIter():
           loss_tap  int     loss should be calculated in [loss_tap : n_steps]
     - Time starts at 0. and increases by 1. each step
     - Assuming a sufficiently long sequence,
-          First few: step_size <= n_steps <= window_size (increases by step_size)
+          First few: step_size <= n_steps <= window_size
+                     (starts at step_size and increases by step_size
+                      until window_size is reached)
                      n_loss_frames = step_size (from right)
           Middle   : n_steps = window_size
                      n_loss_frames = step_size (from right)
           Last     : window_size - step_size < n_steps <= window_size
                      0 < n_loss_frames <= step_size (from right)
-    - For an insufficiently long sequece, slightly different but still functional
+    - For insufficiently long sequece, slightly different but still functional
     """
     
     def __init__(self, input_tbi, target_tbi, window_size, step_size):
