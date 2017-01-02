@@ -6,37 +6,40 @@
 
 """
 Script for training
+
 Use as:
     THEANO_FLAGS=floatX=float32,device=$DEV,lib.cnmem=1 python -u train.py \
-        --data_dir=$DATA_DIR --save_to=$WORKSPACE_DIR/workspace_$NAME0 \
-        [--load_from=$WORKSPACE_DIR/workspace_$NAME1]
-    where $DEV=gpu0, etc
+        --data_dir=$DATA_DIR --save_to=$WORKSPACE_DIR/workspace_$NAME \
+        [--load_from=$WORKSPACE_DIR/workspace_$LOAD] \
+        | tee -a $WORKSPACE_DIR/$NAME".log"
+    where $DEV=gpu0, etc (it is ok to set $NAME == $LOAD)
 """
 
 from __future__ import print_function # for end option in print()
 from collections import OrderedDict
 import argparse
 from net import Net
-from data import build_id_idx, DataBatchIter, TimeStepIter
+from data import build_id_idx, DataIter
 import time
 import numpy as np
 from subprocess import call
+import sys
 
 def main():
     options = OrderedDict()
 
     options['input_dim']          = 44
     options['target_dim']         = 1
-    options['unit_type']          = 'DILSTM'     # FC/LSTM/GRU/PILSTM/DILSTM
-    # options['lstm_peephole']      = True
-    options['net_width']          = 750
+    options['unit_type']          = 'LSTM'     # FC/LSTM/GRU
+    options['lstm_peephole']      = True
+    options['net_width']          = 1024
     options['net_depth']          = 4
     options['batch_size']         = 64
     options['window_size']        = 128
     options['step_size']          = 64
     options['init_scale']         = 0.02
     options['init_use_ortho']     = False
-    options['learn_init_states']  = False
+    options['learn_init_states']  = True
     options['layer_norm']         = False
     options['skip_connection']    = False
     options['learn_clock_params'] = False
@@ -59,7 +62,12 @@ def main():
     options['lr_lower_bound']     = 1e-7
     options['lr_decay_rate']      = 0.5
     options['max_retry']          = 10
+    options['unroll_scan']        = True      # for faster training time
+                                              # at the expense of compile time
 
+    if options['unroll_scan']:
+        # value 32 found empirically; may need change with different options
+        sys.setrecursionlimit(32 * options['window_size'])
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_dir' , type = str, required = True)
@@ -107,85 +115,71 @@ def main():
     print('Compiling fwd/bwd propagators... ', end = ' ')
     start = time.time()
     f_fwd_bwd_propagate = net.compile_f_fwd_bwd_propagate()
-    if options['learn_init_states']:
-        f_fwd_bwd_for_init = net.compile_f_fwd_bwd_for_init()
-    f_fwd_propagate = net.compile_f_fwd_propagate()
+    f_fwd_propagate     = net.compile_f_fwd_propagate()
     print(lapse_from(start))
 
     print('Compiling updater/initializers...', end = ' ')
     start = time.time()
     f_update_v_params = net.compile_f_update_v_params()
-    if options['learn_init_states']:
-        f_update_init_states = net.compile_f_update_init_states()
-    f_initialize_states = net.compile_f_initialize_states()
     f_initialize_optimizer = net.compile_f_initialize_optimizer()
     print(lapse_from(start))
 
-
-    train_data = DataBatchIter(list_file  = args.data_dir + '/train.list',
-                               input_dim  = options['input_dim'],
-                               target_dim = options['target_dim'],
-                               batch_size = options['batch_size'],
-                               id_idx     = id_idx)
-    dev_data   = DataBatchIter(list_file  = args.data_dir + '/dev.list',
-                               input_dim  = options['input_dim'],
-                               target_dim = options['target_dim'],
-                               batch_size = options['batch_size'],
-                               id_idx     = id_idx)
+    # NOTE: window_size must be the same as that given to Net
+    train_data = DataIter(list_file   = args.data_dir + '/train.list',
+                          window_size = options['window_size'],
+                          step_size   = options['step_size'],
+                          batch_size  = options['batch_size'],
+                          input_dim   = options['input_dim'],
+                          target_dim  = options['target_dim'],
+                          id_idx      = id_idx)
+    dev_data   = DataIter(list_file  = args.data_dir + '/dev.list',
+                          window_size = options['window_size'],
+                          step_size   = options['step_size'],
+                          batch_size  = options['batch_size'],
+                          input_dim   = options['input_dim'],
+                          target_dim  = options['target_dim'],
+                          id_idx      = id_idx)
     
+    chunk_size = options['step_size'] * options['batch_size']
+    trained_frames_per_epoch = \
+        (options['frames_per_epoch'] // chunk_size) * chunk_size
+
     def run_epoch(data_iter, lr_cur):
         """
         lr_cur sets the running mode
             float   training
             None    inference
         """
+        is_training = lr_cur is not None
+        if is_training: # apply BPTT(window_size; step_size)
+            step_size = options['step_size']
+        else: # set next_prev_idx = window_size - 1 for efficiency
+            step_size = options['window_size']
+        frames_per_step = step_size * options['batch_size']
+
+        data_iter.discard_unfinished()
+        data_iter.set_step_size(step_size)
+
         loss_sum = 0.
         frames_seen = 0
-        finished = False
 
-        for input_tbi, target_tbi, id_idx_b, batch_idx in data_iter:
-            f_initialize_states()
-
-            for input_step_tbi, target_step_tbi, time_t, last_tap, loss_tap \
-                    in TimeStepIter(input_tbi   = input_tbi,
-                                    target_tbi  = target_tbi,
-                                    window_size = options['window_size'] \
-                                                  if lr_cur is not None else \
-                                                  options['step_size'],
-                                    step_size   = options['step_size']):
-                
-                learn_init_states = options['learn_init_states'] and \
-                                    time_t[0] == np.float32(0)
-
-                if lr_cur is not None:
-                    if learn_init_states:
-                        loss = f_fwd_bwd_for_init \
-                                   (input_step_tbi, target_step_tbi, time_t,
-                                    id_idx_b, last_tap, loss_tap)
-                    else:
-                        loss = f_fwd_bwd_propagate \
-                                   (input_step_tbi, target_step_tbi, time_t,
-                                    id_idx_b, last_tap, loss_tap)
-                else:
-                    loss = f_fwd_propagate \
-                               (input_step_tbi, target_step_tbi, time_t,
-                                id_idx_b, last_tap, loss_tap)
-                
-                loss_sum    += np.asscalar(loss[0])
-                frames_seen += ((input_step_tbi.shape[0] - loss_tap)
-                                * input_step_tbi.shape[1])
-                
-                if lr_cur is not None:
-                    f_update_v_params(lr_cur)
-                    if learn_init_states:
-                        f_update_init_states(lr_cur)
-                
-                if frames_seen >= options['frames_per_epoch']:
-                    finished = True
-                    break
-            if finished:
+        for input_tbi, target_tbi, time_tb, id_idx_tb in data_iter:
+            if is_training:
+                loss = f_fwd_bwd_propagate(input_tbi, target_tbi, 
+                                           time_tb, id_idx_tb, step_size)
+            else:
+                loss = f_fwd_propagate(input_tbi, target_tbi, 
+                                       time_tb, id_idx_tb, step_size)
+            
+            loss_sum    += np.asscalar(loss[0])
+            frames_seen += frames_per_step
+            
+            if is_training:
+                f_update_v_params(lr_cur)
+            
+            if frames_seen >= trained_frames_per_epoch:
                 break
-        return np.float32(loss_sum / frames_seen), frames_seen
+        return np.float32(loss_sum / frames_seen)
     
 
     """
@@ -215,26 +209,18 @@ def main():
     lr = options['lr_init_val']
     f_initialize_optimizer()
 
-    is_first = True
-    actual_frames_per_epoch = options['frames_per_epoch']
-
     while True:
         print_hline() # -------------------------------------------------------
         print('Training...  ', end = ' ')
         start = time.time()
-        _, trained_frames = run_epoch(train_data, lr)
+        _ = run_epoch(train_data, lr)
         print(lapse_from(start))
 
-        total_trained_frames += trained_frames
-        if is_first:
-            # as all sequences are forced to be of equal
-            # lengths currently, this will stay constant
-            actual_frames_per_epoch = trained_frames
-            is_first = False
+        total_trained_frames += trained_frames_per_epoch
 
         print('Evaluating...', end = ' ')
         start = time.time()
-        loss_cur, _ = run_epoch(dev_data, None)
+        loss_cur = run_epoch(dev_data, None)
         print(lapse_from(start))
 
         print('Total trained frames  : '
@@ -247,7 +233,7 @@ def main():
         if np.isnan(loss_cur):
             loss_cur = np.float32('inf')
         
-        if total_trained_frames == actual_frames_per_epoch or \
+        if total_trained_frames == trained_frames_per_epoch or \
                loss_cur < loss_best:
             print('(best)', end = '')
 
@@ -256,7 +242,7 @@ def main():
             net.save_v_params_to_workspace(name_best)
         print('')
 
-        if total_trained_frames > actual_frames_per_epoch and \
+        if total_trained_frames > trained_frames_per_epoch and \
                loss_prev < loss_cur:
             print_hline() # ---------------------------------------------------
             
@@ -297,7 +283,7 @@ def main():
             net.save_v_params_to_workspace(name_prev)
 
             total_trained_frames_at_pivot \
-                = total_trained_frames - actual_frames_per_epoch
+                = total_trained_frames - trained_frames_per_epoch
     
     net.load_v_params_from_workspace(name_best)
     net.remove_params_file_from_workspace(name_pivot)
@@ -315,10 +301,10 @@ def main():
 
     print('Best network:')
     print('Train set')
-    loss_train, _ = run_epoch(train_data, None)
+    loss_train = run_epoch(train_data, None)
     print('Loss: ' + str(loss_train))
     print('Dev set')
-    loss_dev, _   = run_epoch(dev_data, None)
+    loss_dev = run_epoch(dev_data, None)
     print('Loss: ' + str(loss_dev))
 
 if __name__ == '__main__':

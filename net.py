@@ -13,7 +13,7 @@ import cPickle as pk
 from collections import OrderedDict
 import os
 
-from layers import FCLayer, LSTMLayer, GRULayer, PILSTMLayer, DILSTMLayer
+from layers import FCLayer, LSTMLayer, GRULayer
 from utils import SE_loss, clip_norm, get_random_string
 from optimizers import sgd_update, momentum_update, nesterov_update, \
                        vanilla_force, adadelta_force, rmsprop_force, adam_force
@@ -27,14 +27,15 @@ class Net():
         """
         Mode is determined by whether save_to is None or not
         Training:
-            <options>   OrderedDict { 'option_name' : option_val     }
+            <options>   OrderedDict { 'option_name' : option_val }
             <save_to>   str         'path'
             [load_from] str         'path' (set for re-annealing)
         Inference:
-            [options]   OrderedDict { 'batch_size'  : new_batch_size }
+            <options>   OrderedDict { 'option_name' : option_val }
             (save_to)   NoneType    (leave as none)
             <load_from> str         'path'
-            For inference, only options['batch_size'] is applicable 
+        NOTE: For inference, options['step_size'] and options['batch_size']
+              must be specified
         """
         self._configure(options, save_to, load_from)    
         self._init_params(load_from)
@@ -73,26 +74,41 @@ class Net():
             with open(load_from + '/options.pkl', 'rb') as f:
                 self._options = pk.load(f)
             
-            assert 'batch_size' in options
-            self._options['batch_size'] = options['batch_size']
+            assert 'step_size' in options and 'batch_size' in options
+            # to set next_prev_idx = window_size - 1
+            self._options['window_size'] = options['step_size']
+            self._options['step_size']   = options['step_size']
+            self._options['batch_size']  = options['batch_size']
  
     def _init_params(self, load_from):
         """
         Instantiate layers and store their learnable parameters
+        and state variables
         Load parameter values from file if applicable
         """
         self._params = OrderedDict()
+        self._prev_states = OrderedDict() # not learnable
+
+        def add_states(layer, state_dim):
+            if state_dim <= 0:
+                return
+            self._prev_states[layer.pfx('prev')] = np.zeros \
+                ((self._options['batch_size'], state_dim)).astype('float32')
+            if self._options['learn_init_states']:
+                self._params[layer.pfx('init')] = np.zeros(state_dim) \
+                                                    .astype('float32')
 
         if not self._options['learn_id_embedding']:
             add = 0
         else:
             self._id_embedder = FCLayer(self._pfx + 'FC_id_embedder')
-            self._id_embedder.add_param \
+            state_dim = self._id_embedder.add_param \
                 (params  = self._params,
                  n_in    = self._options['id_count'],
                  n_out   = self._options['id_embedding_dim'],
                  options = self._options,
                  act     = 'lambda x: x')
+            add_states(self._id_embedder, state_dim)
             add = self._options['id_embedding_dim']
 
         self._layers = []
@@ -101,20 +117,22 @@ class Net():
         for i in range(D):
             self._layers.append(eval(self._options['unit_type'] + 'Layer') \
                     (self._pfx + self._options['unit_type'] + '_' + str(i)))
-            self._layers[i].add_param \
+            state_dim = self._layers[i].add_param \
                 (params  = self._params,
                  n_in    = add + (self._options['net_width'] if i > 0 else \
                                   self._options['input_dim']),
                  n_out   = self._options['net_width'],
                  options = self._options)
+            add_states(self._layers[i], state_dim)
         
         self._layers.append(FCLayer(self._pfx + 'FC_output'))
-        self._layers[D].add_param \
+        state_dim = self._layers[D].add_param \
                 (params  = self._params,
                  n_in    = add + self._options['net_width'],
                  n_out   = self._options['target_dim'],
                  options = self._options,
                  act     = 'lambda x: x')
+        add_states(self._layers[D], state_dim)
         
         if load_from is not None:
             len_pfx = len(self._pfx)
@@ -124,57 +142,62 @@ class Net():
 
     def _init_shared_variables(self):
         """
-        Store shared variables for parameters, gradients, and prev_states
-        
-        For options['learn_init_states'], init_states themselves are not
-        directly learnable (gradients are taken wrt v_prev_states, then
-        applied to init states), and hence are stored separately from the rest
+        Initialize shared variables from np.ndarray objects for parameters,
+        prev_states, and gradients
         """
         self._v_params = OrderedDict()
-        self._v_params_wo_init  = OrderedDict()
         for k, v in self._params.iteritems():
             self._v_params[k] = th.shared(v, name = k)
-            if k[-4:] != 'init':
-                self._v_params_wo_init[k] = self._v_params[k]
 
         self._v_prev_states = OrderedDict()
-        for layer in self._layers:
-            layer.add_v_prev_state(self._v_prev_states)
+        for k, v in self._prev_states.iteritems():
+            self._v_prev_states[k] = th.shared(v, name = k)
 
         if self._is_training:
             self._v_grads = \
-                [th.shared(v.get_value() * 0., name = k + '_grad') \
-                 for k, v in self._v_params_wo_init.iteritems()]
+                [th.shared(v * 0., name = k + '_grad') \
+                 for k, v in self._params.iteritems()]
 
-            if self._options['learn_init_states']:
-                self._v_params_for_init  = OrderedDict()
-                for k, v in self._v_params.iteritems():
-                    if k[-4:] == 'init':
-                        self._v_params_for_init[k] = v
-                
-                self._v_grads_for_init = \
-                    [th.shared(v.get_value() * 0., name = k + '_grad') \
-                     for k, v in self._v_prev_states.iteritems()]
-
-    def _setup_forward_graph(self, s_input_tbi, s_time_t, s_id_idx_b,
-                             s_last_tap, v_params, v_prev_states):
+    def _setup_forward_graph(self, s_input_tbi, s_time_tb, s_id_idx_tb,
+                                   s_next_prev_idx):
         """
         Specify layer connections
-        Layers return their final internal states as
-            prev_state_update = (v_prev_state, s_next_prev_state)
-        which are collected as a list and returned along with the final output
+        Layers return their internal states for next time step as
+            prev_state_update = (v_prev_state, state[s_next_prev_idx])
+        which are collected as a list and returned along with the last
+        layer's output
         """
+        def get_v_prev_state(layer):
+            if layer.pfx('prev') in self._v_prev_states:
+                return self._v_prev_states[layer.pfx('prev')]
+            else:
+                return None
+        
+        def get_v_init_state(layer):
+            if layer.pfx('prev') in self._v_prev_states \
+                    and self._options['learn_init_states']:
+                return self._v_params[layer.pfx('init')]
+            else:
+                return None
+
+        def to_one_hot(x_tb, n_class):
+            # 2-dim -> 3-dim version of tt.extra_ops.to_one_hot
+            x = x_tb.flatten()
+            z = tt.zeros((x.shape[0], n_class), dtype = 'float32')
+            y = tt.set_subtensor(z[tt.arange(x.shape[0]), x], 1.)
+            return tt.reshape(y, (x_tb.shape[0], x_tb.shape[1], n_class))
+
         if not self._options['learn_id_embedding']:
             cat = lambda s_below_tbj: s_below_tbj
         else:
-            s_id_emb_bi, _ = self._id_embedder.setup_graph \
-                (s_below_tbj   = tt.extra_ops.to_one_hot \
-                                    (s_id_idx_b, self._options['id_count']),
-                 s_time_t      = None,
-                 s_last_tap    = s_last_tap,
-                 v_params      = v_params,
-                 v_prev_states = v_prev_states)
-            s_id_emb_tbi = tt.tile(s_id_emb_bi, (s_input_tbi.shape[0], 1, 1))
+            s_id_emb_tbi, _ = self._id_embedder.setup_graph \
+                (s_below_tbj     = to_one_hot \
+                                      (s_id_idx_tb, self._options['id_count']),
+                 s_time_tb       = s_time_tb,
+                 s_next_prev_idx = s_next_prev_idx,
+                 v_params        = self._v_params,
+                 v_prev_state_bk = get_v_prev_state(self._id_embedder),
+                 v_init_state_k  = get_v_init_state(self._id_embedder))
             cat = lambda s_below_tbj: tt.concatenate([s_below_tbj,
                                                       s_id_emb_tbi], axis = 2)
 
@@ -186,13 +209,12 @@ class Net():
         # vertical stack: input -> layer[0] -> ... -> layer[D - 1] -> output
         for i in range(D + 1):
             s_outputs[i], update = self._layers[i].setup_graph \
-                (s_below_tbj   = cat(s_outputs[i - 1]),
-                 s_time_t      = s_time_t \
-                                 if self._options['learn_clock_params'] \
-                                 else None,
-                 s_last_tap    = s_last_tap,
-                 v_params      = v_params,
-                 v_prev_states = v_prev_states)
+                (s_below_tbj     = cat(s_outputs[i - 1]),
+                 s_time_tb       = s_time_tb,
+                 s_next_prev_idx = s_next_prev_idx,
+                 v_params        = self._v_params,
+                 v_prev_state_bk = get_v_prev_state(self._layers[i]),
+                 v_init_state_k  = get_v_init_state(self._layers[i]))
             if update is not None:
                 prev_state_updates.append(update)
         
@@ -206,24 +228,25 @@ class Net():
             Updates: _prev_state_updates
         """
         self._port_i_input_tbi = tt.ftensor3(name  = 'port_i_input')
-        self._port_i_time_t    = tt.fvector (name  = 'port_i_time')
-        self._port_i_id_idx_b  = tt.ivector (name  = 'port_i_id_idx')
+        self._port_i_time_tb   = tt.fmatrix (name  = 'port_i_time')
+        self._port_i_id_idx_tb = tt.imatrix (name  = 'port_i_id_idx')
         
-        s_last_tap = self._port_i_input_tbi.shape[0] - 1 # fixed at last step
+        # step_size is a compile time constant for inference
+        s_next_prev_idx = tt.alloc(np.int32(self._options['step_size'] - 1))
 
-        self._port_o_output, self._prev_state_updates = \
-            self._setup_forward_graph(s_input_tbi   = self._port_i_input_tbi,
-                                      s_time_t      = self._port_i_time_t,
-                                      s_id_idx_b    = self._port_i_id_idx_b,
-                                      s_last_tap    = s_last_tap,
-                                      v_params      = self._v_params,
-                                      v_prev_states = self._v_prev_states)
+        self._port_o_output_tbi, self._prev_state_updates = \
+            self._setup_forward_graph(s_input_tbi     = self._port_i_input_tbi,
+                                      s_time_tb       = self._port_i_time_tb,
+                                      s_id_idx_tb     = self._port_i_id_idx_tb,
+                                      s_next_prev_idx = s_next_prev_idx)
 
-    def _setup_loss_graph(self, s_output_tbi, s_target_tbi, s_loss_tap):
+    def _setup_loss_graph(self, s_output_tbi, s_target_tbi, s_step_size):
         """
         Connect a loss function to the graph
+        See data.py for explanation of the slicing part
         """
-        return SE_loss(s_output_tbi[s_loss_tap :], s_target_tbi[s_loss_tap :])
+        return SE_loss(s_output_tbi[-s_step_size :],
+                       s_target_tbi[-s_step_size :])
 
     def _setup_grad_updates_graph(self, s_loss, v_wrt, v_grads):
         """
@@ -244,7 +267,7 @@ class Net():
         optimizer to new values of parameters, and inform how optimizer
         should be initiated/updated
             optim_state_init = (v_optim_state, s_init_optim_state)
-            param_update     = (v_param, s_new_param) or 
+            param_update     = (v_param, s_new_param) plus 
                                (v_optim_state, s_new_optim_state)
         Assumes that v_grads has been updated prior to applying param_updates
         NOTE: Takes inputs as lists instead of OrderedDict
@@ -268,89 +291,46 @@ class Net():
         """
         Connect graphs together for training and store in/out ports & updates
             Input  : _port_i_input, _port_i_target, _port_i_time,
-                     _port_i_id_idx_b, _port_i_last_tap, _port_i_loss_tap,
-                     _port_i_lr, 
+                     _port_i_id_idx_tb, _port_i_step_size, _port_i_lr, 
             Output : _port_o_loss
             Updates: _prev_state_updates, _grad_updates,
-                    _optim_state_inits, _param_updates
+                     _optim_state_inits, _param_updates
         """
         self._port_i_input_tbi  = tt.ftensor3(name = 'port_i_input')
         self._port_i_target_tbi = tt.ftensor3(name = 'port_i_target')
-        self._port_i_time_t     = tt.fvector (name = 'port_i_time')
-        self._port_i_id_idx_b   = tt.ivector (name = 'port_i_id_idx')
-        self._port_i_last_tap   = tt.iscalar (name = 'port_i_last_tap')
-        self._port_i_loss_tap   = tt.iscalar (name = 'port_i_loss_tap')
+        self._port_i_time_tb    = tt.fmatrix (name = 'port_i_time')
+        self._port_i_id_idx_tb  = tt.imatrix (name = 'port_i_id_idx')
+        self._port_i_step_size  = tt.iscalar (name = 'port_i_step_size')
         self._port_i_lr         = tt.fscalar (name = 'port_i_lr')
 
         s_output_tbi, self._prev_state_updates = \
-            self._setup_forward_graph(s_input_tbi   = self._port_i_input_tbi,
-                                      s_time_t      = self._port_i_time_t,
-                                      s_id_idx_b    = self._port_i_id_idx_b,
-                                      s_last_tap    = self._port_i_last_tap,
-                                      v_params      = self._v_params,
-                                      v_prev_states = self._v_prev_states)
+            self._setup_forward_graph \
+                (s_input_tbi     = self._port_i_input_tbi,
+                 s_time_tb       = self._port_i_time_tb,
+                 s_id_idx_tb     = self._port_i_id_idx_tb,
+                 s_next_prev_idx = self._port_i_step_size - 1)
 
         self._port_o_loss = self._setup_loss_graph \
                                 (s_output_tbi = s_output_tbi,
                                  s_target_tbi = self._port_i_target_tbi,
-                                 s_loss_tap   = self._port_i_loss_tap)
+                                 s_step_size  = self._port_i_step_size)
 
         self._grad_updates  = self._setup_grad_updates_graph \
                                 (s_loss   = self._port_o_loss,
-                                 v_wrt    = self._v_params_wo_init.values(),
+                                 v_wrt    = self._v_params.values(),
                                  v_grads  = self._v_grads)
         
         self._optim_state_inits, self._param_updates = \
             self._setup_param_updates_graph \
                                 (s_lr     = self._port_i_lr,
-                                 v_params = self._v_params_wo_init.values(),
+                                 v_params = self._v_params.values(),
                                  v_grads  = self._v_grads)
-        
-        if self._options['learn_init_states']:
-            self._grad_updates_for_init = self._setup_grad_updates_graph \
-                                    (s_loss   = self._port_o_loss,
-                                     v_wrt    = self._v_prev_states.values(),
-                                     v_grads  = self._v_grads_for_init)
-            
-            s_grads_for_init_flattened = [tt.mean(v, axis = 0) \
-                                          for v in self._v_grads_for_init]
-            
-            optim_state_inits_for_init, self._param_updates_for_init = \
-                self._setup_param_updates_graph \
-                                (s_lr     = self._port_i_lr,
-                                 v_params = self._v_params_for_init.values(),
-                                 v_grads  = s_grads_for_init_flattened)
-            
-            self._optim_state_inits.extend(optim_state_inits_for_init)
-        
-    def compile_f_initialize_states(self):
-        """
-        Compile a callable object of signature
-            f() -> None
-        As a side effect, calling it updates
-            _v_prev_states['$_prev'] <- 0-tensors or _v_params['$_init']
-                                       (latter if options['learn_init_states'])
-        For both training & inference;
-            needs to be called before launching a sequence at t = 0
-        """
-        if not self._options['learn_init_states']:
-            updates = [(v, tt.zeros_like(v)) \
-                       for v in self._v_prev_states.itervalues()]
-        else:
-            to_init = lambda k: k[:-4] + 'init'
-            updates = [(v, tt.tile(self._v_params[to_init(k)],
-                                   (self._options['batch_size'], 1))) \
-                       for k, v in self._v_prev_states.iteritems()]
-        return th.function(inputs  = [],
-                           outputs = [],
-                           updates = updates)
 
     def compile_f_fwd_propagate(self):
         """
         Compile a callable object of signature
-            f(input_tbi, target_tbi, time_t,
-              id_idx_b, last_tap, loss_tap) -> loss         (for training)
-            f(input_tbi, time_t, id_idx_b)  -> output_tbi   (for inference)
+            (training)  f(input_tbi, target_tbi, time_tb, id_idx_tb) -> loss
+            (inference) f(input_tbi, time_tb, id_idx_tb) -> output_tbi
         As a side effect, calling it updates
             _v_prev_states <- _prev_state_updates
         
@@ -359,8 +339,8 @@ class Net():
         if self._is_training:
             return th.function \
                 (inputs  = [self._port_i_input_tbi, self._port_i_target_tbi,
-                            self._port_i_time_t   , self._port_i_id_idx_b,
-                            self._port_i_last_tap , self._port_i_loss_tap],
+                            self._port_i_time_tb  , self._port_i_id_idx_tb,
+                            self._port_i_step_size],
                  outputs = [self._port_o_loss],
                  updates = self._prev_state_updates,
          on_unused_input = 'raise' if self._options['learn_clock_params'] \
@@ -368,9 +348,9 @@ class Net():
                                    else 'ignore')
         else:
             return th.function \
-                (inputs  = [self._port_i_input_tbi, self._port_i_time_t,
-                            self._port_i_id_idx_b],
-                 outputs = [self._port_o_output],
+                (inputs  = [self._port_i_input_tbi, self._port_i_time_tb,
+                            self._port_i_id_idx_tb],
+                 outputs = [self._port_o_output_tbi],
                  updates = self._prev_state_updates,
          on_unused_input = 'raise' if self._options['learn_clock_params'] \
                                    or self._options['learn_id_embedding'] \
@@ -379,20 +359,20 @@ class Net():
     def compile_f_fwd_bwd_propagate(self):
         """
         Compile a callable object of signature
-            f(input_tbi, target_tbi, time_t, id_idx_b) -> loss
+            f(input_tbi, target_tbi, time_tb, id_idx_tb) -> loss
         As a side effect, calling it updates
             _v_grads       <- _grad_updates
             _v_prev_states <- _prev_state_updates
         
-        NOTE: Output is a list of np.ndarray (even if 1 output & scalar)
+        NOTE: Output is a list of np.ndarray (i.e., 0-th element is np.ndarray)
               To get loss but not update params (for validation),
               call f_fwd_propagate instead
         """
         assert self._is_training
         return th.function \
             (inputs  = [self._port_i_input_tbi, self._port_i_target_tbi,
-                        self._port_i_time_t   , self._port_i_id_idx_b,
-                        self._port_i_last_tap , self._port_i_loss_tap],
+                        self._port_i_time_tb  , self._port_i_id_idx_tb,
+                        self._port_i_step_size],
              outputs = [self._port_o_loss],
              updates = self._grad_updates + self._prev_state_updates,
      on_unused_input = 'raise' if self._options['learn_clock_params'] \
@@ -415,33 +395,6 @@ class Net():
         return th.function(inputs  = [self._port_i_lr],
                            outputs = [],
                            updates = self._param_updates)
-    
-    def compile_f_fwd_bwd_for_init(self):
-        """
-        NOTE: For the first time step during options['learn_init_states'],
-              call f_fwd_bwd_for_init *instead of* f_fwd_bwd_propagate
-        """
-        assert self._is_training and self._options['learn_init_states']
-        return th.function \
-            (inputs  = [self._port_i_input_tbi, self._port_i_target_tbi,
-                        self._port_i_time_t   , self._port_i_id_idx_b,
-                        self._port_i_last_tap , self._port_i_loss_tap],
-             outputs = [self._port_o_loss],
-             updates = (self._grad_updates + self._prev_state_updates
-                        + self._grad_updates_for_init),
-     on_unused_input = 'raise' if self._options['learn_clock_params'] \
-                               or self._options['learn_id_embedding'] \
-                               else 'ignore')
-    
-    def compile_f_update_init_states(self):
-        """
-        NOTE: For the first time step during options['learn_init_states'],
-              call f_update_init_states *in addition to* f_update_v_params
-        """
-        assert self._is_training and self._options['learn_init_states']
-        return th.function(inputs  = [self._port_i_lr],
-                           outputs = [],
-                           updates = self._param_updates_for_init)
 
     def compile_f_initialize_optimizer(self):
         """
@@ -460,7 +413,6 @@ class Net():
         """
         Transfer parameters from GPU to file
         Extension '.npz' appended inside
-        For use during annealing
         """
         assert self._is_training
         for k, v_param in self._v_params.iteritems():
@@ -476,7 +428,6 @@ class Net():
         """
         Transfer parameters from file to GPU
         Extension '.npz' appended inside
-        For use during annealing
         """
         assert self._is_training
         if name is None:
@@ -489,7 +440,6 @@ class Net():
         """
         Remove temporary file from the workspace
         Extension '.npz' appended inside
-        For use during annealing
         """
         assert self._is_training
         if name is None:
@@ -504,7 +454,9 @@ class Net():
     
     def save_param(self, param_name, filename):
         """
-        Cannot be used during training as params is not kept up to date
+        Save an individual parameter to file (intended for debugging)
+        Cannot be used during training as _params is not updated unless
+        save_v_params_to_workspace is called during training
         """
         assert not self._is_training and \
                self._pfx + param_name in self._params

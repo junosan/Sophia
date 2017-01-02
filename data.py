@@ -5,7 +5,38 @@
 #==========================================================================#
 
 """
-Iterator classes for shuffled sequence batches and their time slices
+Iterator class for time slices of shuffled sequence minibatches
+
+- Creates time slices suitable for BPTT(h; h'), where
+      h = window_size, h' = step_size (see doi:10.1162/neco.1990.2.4.490)
+  For training, h = 2 h' is recommended
+  For inference, h = h' is recommended (h > h' produces correct results,
+                                        but wastes computation)
+- For unroll_scan option to work in Net, window_size must be a compile time
+  constant and hence cannot be changed once a Net is instantiated
+- Sequences are assumed to be of arbitrary lengths, each with their own clocks
+- Sequences are each given an id_idx to be used as an one-hot encoding index
+  (may be ignored if not using ID information)
+- Call discard_unfinished to use new sequences next iteration
+- Use as
+      for input_tbi, target_tbi, time_tb, id_idx_tb in data_iter:
+          (loop content)
+  where return values are np.ndarray's of dimensions
+      input     float32     [window_size][batch_size][input_dim ]
+      target    float32     [window_size][batch_size][target_dim]
+      time      float32     [window_size][batch_size]
+      id_idx    int32       [window_size][batch_size]
+  randomly shuffled in 1-th (batch) dimension
+- Time starts at 0. and increases by 1. each time index; 0. signals state reset
+- Upon each iteration, 
+    - Previous arrays are shifted by step_size to the left
+    - New step_size amount of data are read from files and put on the right
+    - Loss is to be calculated from the last step_size time indices
+    - States are to be rewound to time index (step_size - 1) after propagation
+- First few iterations may have zeros or irrelevant data on the left, but
+  states will be reset when the real data starts and loss won't be calculated
+  in or be propagated to the zero-padded/irrelevant region
+- Unless stopped explicitly inside the loop, iterates indefinitely
 """
 
 import numpy as np
@@ -27,157 +58,112 @@ def build_id_idx(list_file):
                 id_idx[_id] = len(id_idx)
     return id_idx
 
-class DataBatchIter():
-    """
-    - for input_tbi, target_tbi, id_idx_b, batch_idx in DataBatchIter(args):
-          (loop content)
-    - Upon each iteration, returns tuple of np.ndarray's and batch_idx
-          input     float32 [all_timesteps][batch_size][input_dim ]
-          target    float32 [all_timesteps][batch_size][target_dim]
-          id_idx    int     [batch_size]
-          batch_idx (increases indefinitely every iteration)
-      randomly shuffled in batch dimension
-    - Files are read lazily when next() is called
-    - Unless stopped explicitly inside loop, iterates indefinitely
-    - Currently assumes that all sequences are of equal length
-    """
+class DataIter():
+    def __iter__(self):
+        return self
 
-    def __init__(self, list_file, input_dim, target_dim, batch_size, id_idx):
-        self.data_root  = list_file[: list_file.rfind('/') + 1] # includes /
-        self.input_dim  = input_dim
-        self.target_dim = target_dim
-        self.batch_size = batch_size
-        self.id_idx     = id_idx
+    def __init__(self, list_file, window_size, step_size,
+                 batch_size, input_dim, target_dim, id_idx):
+        self._data_root   = list_file[: list_file.rfind('/') + 1] # includes /
+        self._window_size = window_size
+        self.set_step_size(step_size)
+        self._batch_size  = batch_size
+        self._input_dim   = input_dim
+        self._target_dim  = target_dim
+        self._id_idx      = id_idx
 
-        self.seqs = []
+        # buffers for last minibatch
+        self._input_tbi  = np.zeros((window_size, batch_size, input_dim )) \
+                             .astype('float32')
+        self._target_tbi = np.zeros((window_size, batch_size, target_dim)) \
+                             .astype('float32')
+        self._time_tb    = np.zeros((window_size, batch_size)) \
+                             .astype('float32')
+        self._id_idx_tb  = np.zeros((window_size, batch_size)) \
+                             .astype('int32')
+        
+        # buffers for currently open files
+        # new files are read when time index reaches input.shape[0]
+        self._t_idxs  = batch_size * [0] # time index cursors in files
+        self._id_idxs = batch_size * [0] # id_idx values
+        self._inputs  = batch_size * [np.zeros((0, input_dim )) \
+                                        .astype('float32')]
+        self._targets = batch_size * [np.zeros((0, target_dim)) \
+                                        .astype('float32')]
+
+        self._seqs = []
         with open(list_file) as f:
             for line in f:
-                self.seqs.append(line.strip())
-        self.n_seqs = len(self.seqs)
-        assert self.n_seqs > 0
+                self._seqs.append(line.strip())
+        self._n_seqs = len(self._seqs)
+        assert self._n_seqs > 0
         
-        # '<f4' means little endian, float, 4 bytes
-        #     https://docs.scipy.org/doc/numpy/reference/arrays.dtypes.html
-        input_ti = np.fromfile(self.data_root + self.seqs[0] + '.input',
-                               dtype = '<f4').reshape((-1, input_dim ))
-        
-        # all files checked against this length (for now)
-        self.all_timesteps = input_ti.shape[0]
+        self._shuffle()
 
-        self.batch_idx = 0
-        self.reset_seq_order()
+    def _shuffle(self):
+        self._seq_idx = 0
+        self._seq_order = np.random.permutation(self._n_seqs) # of np.arange(n)
 
-    def __iter__(self):
-        return self
+    def _pop_seq(self):
+        if self._seq_idx >= self._n_seqs:
+            self._shuffle()
+        seq = self._seqs[self._seq_order[self._seq_idx]]
+        self._seq_idx += 1
+        return seq
 
-    def reset_seq_order(self):
-        self.seq_idx = 0
-        self.seq_order = np.random.permutation(self.n_seqs) # of np.arange(n)
-    
-    def seq(self, seq_idx):
-        return self.seqs[self.seq_order[seq_idx]]
+    def _read(self, batch_idx):
+        seq = self._pop_seq()
 
-    def read(self, seq_idx):
-        """
-        Returns tuple of np.ndarray's
-            [all_timesteps][input_dim], [all_timesteps][target_dim]
-        """
-        input_ti  = np.fromfile(self.data_root + self.seq(seq_idx) + '.input' ,
-                                dtype = '<f4').reshape((-1, self.input_dim ))
-        target_ti = np.fromfile(self.data_root + self.seq(seq_idx) + '.target',
-                                dtype = '<f4').reshape((-1, self.target_dim))
+        self._t_idxs [batch_idx] = 0
+        self._id_idxs[batch_idx] = self._id_idx[seq_to_id(seq)]
 
-        assert input_ti .shape[0] == self.all_timesteps
-        assert target_ti.shape[0] == self.all_timesteps
+        # dtype '<f4' means little endian, float, 4 bytes
+        self._inputs[batch_idx] = \
+            np.fromfile(self._data_root + seq + '.input' , dtype = '<f4') \
+              .reshape((-1, self._input_dim )).astype('float32')
+        self._targets[batch_idx] = \
+            np.fromfile(self._data_root + seq + '.target', dtype = '<f4') \
+              .reshape((-1, self._target_dim)).astype('float32')
+        assert self._inputs[batch_idx].shape[0] \
+               == self._targets[batch_idx].shape[0]
 
-        return input_ti, target_ti
+    def discard_unfinished(self):
+        for b in range(self._batch_size):
+            if self._t_idxs[b] > 0:
+                self._t_idxs[b] = self._inputs[b].shape[0]
+
+    def set_step_size(self, step_size):
+        assert self._window_size >= step_size
+        self._step_size = step_size
 
     def next(self):
-        input_tbi  = np.zeros \
-                     ((self.all_timesteps, self.batch_size, self.input_dim )) \
-                     .astype('float32')
-        target_tbi = np.zeros \
-                     ((self.all_timesteps, self.batch_size, self.target_dim)) \
-                     .astype('float32')
-        id_idx_b   = np.zeros(self.batch_size).astype('int32')
+        def shift(arr, d): arr[: -d] = arr[d :]
+
+        shift(self._input_tbi , self._step_size)
+        shift(self._target_tbi, self._step_size)
+        shift(self._time_tb   , self._step_size)
+        shift(self._id_idx_tb , self._step_size)
+
+        for b in range(self._batch_size):
+            cur = self._window_size - self._step_size
+
+            while cur < self._window_size:
+                while self._t_idxs[b] >= self._inputs[b].shape[0]:
+                    self._read(b)
+                
+                inc = min(self._window_size - cur,
+                          self._inputs[b].shape[0] - self._t_idxs[b])
+                rng_b = range(cur, cur + inc)
+                rng_f = range(self._t_idxs[b], self._t_idxs[b] + inc)
+
+                self._input_tbi [rng_b, b, :] = self._inputs [b][rng_f, :]
+                self._target_tbi[rng_b, b, :] = self._targets[b][rng_f, :]
+                self._time_tb   [rng_b, b]    = np.array(rng_f) \
+                                                  .astype('float32')
+                self._id_idx_tb [rng_b, b]    = self._id_idxs[b]
+
+                cur += inc
+                self._t_idxs[b] += inc
         
-        for b in range(self.batch_size):
-            if self.seq_idx >= self.n_seqs:
-                self.reset_seq_order()
-
-            input_tbi[:, b, :], target_tbi[:, b, :] = self.read(self.seq_idx)
-            id_idx_b[b] = self.id_idx[seq_to_id(self.seq(self.seq_idx))]
-
-            self.seq_idx += 1
-        
-        self.batch_idx += 1
-
-        return input_tbi, target_tbi, id_idx_b, self.batch_idx - 1
-
-
-class TimeStepIter():
-    """
-    Creates time slices suitable for BPTT(h; h'), where
-        h = window_size, h' = step_size (doi:10.1162/neco.1990.2.4.490)
-    - window_size >= step_size; for inference, set window_size = step_size
-    - Intended for use as inner loop of DataBatchIter's loop
-    - Use as
-          for input_step_tbi, target_step_tbi, time_t, \
-                  last_tap, loss_tap in TimeStepIter(args):
-              (loop content)
-    - Upon each iteration, returns tuple of np.ndarray's and taps
-          input     float32 [n_steps][batch_size][input_dim ]
-          target    float32 [n_steps][batch_size][target_dim]
-          time      float32 [n_steps]
-          last_tap  int     scan should return as update (tt.switch)
-                                last_tap == -1: prev_state
-                                otherwise     : state[last_tap]
-                            i.e., rewind states to last_tap after backprop
-          loss_tap  int     loss should be calculated in [loss_tap : n_steps]
-    - Time starts at 0. and increases by 1. each step
-    - Assuming a sufficiently long sequence,
-          First few: step_size <= n_steps <= window_size
-                     (starts at step_size and increases by step_size
-                      until window_size is reached)
-                     n_loss_frames = step_size (from right)
-          Middle   : n_steps = window_size
-                     n_loss_frames = step_size (from right)
-          Last     : window_size - step_size < n_steps <= window_size
-                     0 < n_loss_frames <= step_size (from right)
-    - For insufficiently long sequece, slightly different but still functional
-    """
-    
-    def __init__(self, input_tbi, target_tbi, window_size, step_size):
-        assert input_tbi.shape[0] == target_tbi.shape[0]
-        assert window_size >= step_size
-
-        self.input_tbi   = input_tbi
-        self.target_tbi  = target_tbi
-        self.step_size   = step_size
-
-        self.all_timesteps = self.input_tbi.shape[0]
-        self.time_idx = 0
-        self.wind_idx = step_size - window_size
-
-    def __iter__(self):
-        return self
-    
-    def next(self):
-        if self.time_idx >= self.all_timesteps:
-            raise StopIteration()
-        
-        next_idx = min(self.time_idx + self.step_size, self.all_timesteps)
-        
-        shift = -min(0, self.wind_idx)
-        rng = range(self.wind_idx + shift, next_idx)
-
-        last_tap = min(max(0, self.step_size - shift) - 1, len(rng) - 1)
-        loss_tap = self.time_idx - rng[0]
-
-        self.wind_idx += self.step_size
-        self.time_idx = next_idx
-
-        return self.input_tbi[rng, :, :], \
-               self.target_tbi[rng, :, :], \
-               np.array(rng).astype('float32'), \
-               last_tap, loss_tap
+        return self._input_tbi, self._target_tbi, \
+               self._time_tb, self._id_idx_tb
