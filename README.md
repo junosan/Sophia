@@ -5,41 +5,60 @@
 [//]: # "                       Proprietary and confidential                       "
 [//]: # "=========================================================================="
 
-# Introduction
-Sophia (Greek for "wisdom") is based on Theano and focuses on training and
-evaluating recurrent neural networks for regression tasks on long inputs.
 
-Some features:
-* Implements [BPTT(h; h')](https://doi.org/10.1162/neco.1990.2.4.490) for more efficient training
-* Trains on minibatches of sequences of unequal lengths
+# Introduction
+Sophia (Greek for "wisdom") is based on Theano and focuses on testing 
+experimental recurrent neural network architectures  for regression tasks on
+long and noisy inputs.
+
+Notable features:
+* Implements [BPTT(h; h')](https://doi.org/10.1162/neco.1990.2.4.490)
+  for more efficient training
 * Scheduled learning rate annealing with patience
-* Various recurrent units and optimizers
+* Various unit options
+ ([batch norm](https://arxiv.org/abs/1603.09025),
+  [residual gate](https://arxiv.org/abs/1611.01260),
+  initial state learning, etc.)
+  and optimizers
+ ([Nesterov](https://arxiv.org/abs/1212.0901),
+  [Adadelta](https://arxiv.org/abs/1212.5701),
+  [RMSProp](http://www.cs.toronto.edu/~tijmen/csc321/slides/lecture_slides_lec6.pdf),
+  [Adam](https://arxiv.org/abs/1412.6980))
+* Options for learning time-dimension
+  (e.g., [Phased LSTM](https://arxiv.org/abs/1610.09513))
+  or batch-dimension (e.g., sequence ID) parameters
 * Option for faster training by unrolling Theano scans (increases compile time)
-* Option for learning time-dimension (e.g., [Phased LSTM](https://arxiv.org/abs/1610.09513)) or batch-dimension (e.g., speaker ID) parameters
-* Self-documenting object-oriented code
+* Self-documenting object oriented code
+
 
 # How to use
 
-## Prerequisites
-- Theano (developed on 0.9.0.dev4-py2.7): follow through their installation instructions using Miniconda, along with the bleeding-edge installation, latest version of libgpuarray, cuDNN, etc.
-- Input and target data preprocessed and saved as separate binary files ([timesteps][dimensions] order)
+## Requirements
+* Theano (developed on 0.9.0.dev4-py2.7): follow through the
+  [installation instructions](http://deeplearning.net/software/theano_versions/dev/install.html)
+  using Miniconda, along with the bleeding-edge installation of Theano,
+  latest version of libgpuarray, and cuDNN
+* Input and target data preprocessed and saved as separate binary files
+  ([timesteps][dimensions] order)
 
 ## Options
-|     option name      |                                     explanation                                      |
-|:--------------------:|:------------------------------------------------------------------------------------:|
-|input_dim, target_dim |currently set to 44, 1                                                                |
-|      unit_type       |'FC'/'LSTM'/'GRU'                                                                     |
-| net_width, net_depth |# of params ~ W<sup>2</sup> D                                                         |
-|      batch_size      |minibatch size                                                                        |
-|window_size, step_size|for [BPTT(h; h')](doi:10.1162/neco.1990.2.4.490)                                      |
-|  learn_init_states   |False/True                                                                            |
-|      layer_norm      |False/True ([arXiv:1607.06450](https://arxiv.org/abs/1607.06450); modified version of)|
-|   skip_connection    |False/True ([arXiv:1611.01260](https://arxiv.org/abs/1611.01260))                     |
-|  learn_clock_params  |False/True ([arXiv:1610.09513](https://arxiv.org/abs/1610.09513))                     |
-|     update_type      |'sgd'/'momentum'/'nesterov'                                                           |
-|      force_type      |'vanilla'/'adadelta'/'rmsprop'/'adam'                                                 |
-|   frames_per_epoch   |time_indices * batch_size per epoch                                                   |
-|lr_init_val, lr_lower_bound, <br> lr_decay_rate, max_retry| for learning rate annealing                      |
+|     option name      |                            explanation                            |
+|:--------------------:|:-----------------------------------------------------------------:|
+|input_dim, target_dim |currently set to 44, 1                                             |
+|      unit_type       |'FC'/'LSTM'/'GRU'                                                  |
+| net_width, net_depth |# of params ~ W<sup>2</sup> D                                      |
+|      batch_size      |minibatch size                                                     |
+|window_size, step_size|for [BPTT(h; h')](doi:10.1162/neco.1990.2.4.490)                   |
+|      batch_norm      |False/[True](https://arxiv.org/abs/1603.09025)                     |
+|    residual_gate     |False/[True](https://arxiv.org/abs/1611.01260)                     |
+|  learn_init_states   |False/True                                                         |
+|  learn_clock_params  |False/[True](https://arxiv.org/abs/1610.09513)                     |
+|     update_type      |'sgd'/'momentum'/'nesterov'                                        |
+|      force_type      |'vanilla'/'adadelta'/'rmsprop'/'adam'                              |
+|   frames_per_epoch   |time_indices * batch_size per epoch                                |
+|   lr_*, max_retry    |for learning rate annealing with patience                          |
+|     unroll_scan      |trades memory consumption & slower compile time for faster training|
+
 
 # Code reference
 
@@ -60,10 +79,10 @@ Some features:
 <br>
 
 
-|          suffix           |              explanation              |        
-|:-------------------------:|:-------------------------------------:|
-|<tensor_name>_[t][b][i/j/k]|[time][batch][hidden] dimensions       |
-|    <individual_name>s     |collections (list, dict, etc)          |
+|           suffix            |              explanation              |        
+|:---------------------------:|:-------------------------------------:|
+|<tensor_name>_[t][b][i/j/k/l]|[time][batch][hidden] dimensions       |
+|     <individual_name>s      |collections (list, dict, etc)          |
 
 <br>
 
@@ -76,7 +95,7 @@ Some features:
 |   params    |OrderedDict|   str : np.ndarray    |learnable parameters (on CPU memory)             <br> used for initialization or as a buffer   |
 |  v_params   |OrderedDict|str : th.SharedVariable|learnable parameters (on GPU memory)                                                           |
 |   v_grads   |    list   |   th.SharedVariable   |loss gradients wrt above; same order as above                                                  |
-|v_prev_states|OrderedDict|str : th.SharedVariable|state values right before this time step                                                       |
+|v_prev_states|OrderedDict|str : th.SharedVariable|state values right before this time step starts                                                |
 |  *_updates  |    list   |       (v_$, s_$)      |give this to th.function to make a function that <br> actually performs the updates when called|
 
 <br>
@@ -84,24 +103,27 @@ Some features:
 
 ## Summary of functions in class Net
 
-|            name              |                                    explanation; input -> output                                     |
-|:----------------------------:|:---------------------------------------------------------------------------------------------------:|
-|         _init_params         |add layers and fill params (either freshly, or from file)                                            |
-|    _init_shared_variables    |fill v_params[, v_grads], v_prev_states                                                              |
-|     _setup_forward_graph     |s_input, s_time, s_id_idx, s_next_prev_idx -> s_output, prev_state_updates                           |
-|    _setup_inference_graph    |setup full graph and store ports ([input, time, id_idx], [output]) and updates (prev_state_updates)  |
-|      _setup_loss_graph       |s_output, s_target, s_step_size -> s_loss                                                            |
-|  _setup_grad_updates_graph   |s_loss, v_wrt, v_grads -> grad_updates                                                               |
-|  _setup_param_updates_graph  |s_lr, v_params, v_grads -> optim_state_inits, param_updates                                          |
-|    _setup_training_graph     |setup full graph and store ports ([input, target, time, id_idx, step_size, lr], [loss]) and updates (prev_state_updates, grad_updates, optim_state_inits, param_updates)|
+|            name              |                                    explanation; input -> output                                   |
+|:----------------------------:|:-------------------------------------------------------------------------------------------------:|
+|         _init_params         |add layers and fill params (either freshly, or from file)                                          |
+|    _init_shared_variables    |fill v_params[, v_grads], v_prev_states                                                            |
+|     _setup_forward_graph     |s_input, s_time, s_id_idx, s_next_prev_idx -> s_output, prev_state_updates, stat_updates           |
+|    _setup_inference_graph    |setup full graph and store ports ([input, time, id_idx], [output]) and updates (prev_state_updates)|
+|      _setup_loss_graph       |s_output, s_target, s_step_size -> s_loss                                                          |
+|  _setup_grad_updates_graph   |s_loss, v_wrt, v_grads -> grad_updates                                                             |
+|  _setup_param_updates_graph  |s_lr, v_params, v_grads -> optim_state_inits, param_updates                                        |
+|    _setup_training_graph     |setup full graph and store ports ([input, target, time, id_idx, step_size, lr], [loss]) and updates (prev_state_updates, stat_updates, grad_updates, optim_state_inits, param_updates)|
 |   compile_f_fwd_propagate    |(training): _ -> th.function([input, target, time, id_idx, step_size], [loss], prev_state_updates) <br> (inference): _ -> th.function([input, time, id_idx], [output], prev_state_updates)|
-| compile_f_fwd_bwd_propagate  |_ -> th.function([input, target, time, id_idx, step_size], [loss], prev_state_updates + grad_updates)|
-|  compile_f_update_v_params   |_ -> th.function([lr], [], param_updates)                                                            |
-|compile_f_initialize_optimizer|_ -> th.function([], [], optim_state_inits)                                                          |
+| compile_f_fwd_bwd_propagate  |_ -> th.function([input, target, time, id_idx, step_size], [loss], grad_updates + prev_state_updates + stat_updates)|
+|  compile_f_update_v_params   |_ -> th.function([lr], [], param_updates)                                                          |
+|compile_f_initialize_optimizer|_ -> th.function([], [], optim_state_inits)                                                        |
 
-* *target* means ground truth from files, *output* means what comes out of the net
-* All updates to shared variables take place via repeated calls to f_* (callable objects returned by th.function)
-* Within a single update, [the order between elements in the updates list does not matter](http://stackoverflow.com/questions/28205589/the-update-order-of-theano-functions-update-list)
+* *target* means ground truth from files, *output* means what comes out of
+  the net
+* All updates to shared variables take place via repeated calls to f_*
+  (callable objects returned by th.function)
+* Within a single update, the order between elements in the updates list
+  [does not matter](http://stackoverflow.com/questions/28205589/the-update-order-of-theano-functions-update-list)
 
 <br>
 
@@ -110,9 +132,11 @@ Some features:
 - Reinforcement learning on pre-trained nets
 
 ## Miscellaneous notes
+* [NumPy/Theano broadcasting rules](https://docs.scipy.org/doc/numpy/user/basics.broadcasting.html)
 * [SliceableOrderedDict](http://stackoverflow.com/questions/30975339/slicing-a-python-ordereddict)
+
 
 # Acknowledgements
 Consulted code from
-- Layer normalization: https://github.com/ryankiros/layer-norm (license not specified)
-- Learning rate annealing: https://github.com/KyuyeonHwang/Fractal (Apache-2.0 license)
+* [Theano LSTM implementation reference](http://deeplearning.net/tutorial/lstm.html) (license not specified)
+* [Learning rate annealing with patience](https://github.com/KyuyeonHwang/Fractal) (Apache-2.0 license)

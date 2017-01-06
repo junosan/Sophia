@@ -44,7 +44,7 @@ class Ensemble():
         self._input_dim = 0  # set below
         self._target_dim = 0 # set below
         self._nets = []
-        self._props = [] # f(input_tbi, time_tb, id_idx_tb) -> output_tbi
+        self._props = [] # f(input_tbi, time_t, id_idx_tb) -> output_tbi
 
         for workspace in workspaces:
             self._nets.append(Net(options, None, workspace))
@@ -63,7 +63,7 @@ class Ensemble():
         """
         Rewind to t = 0
         """
-        self._time_tb = np.zeros((1, self._batch_size)).astype('float32')
+        self._time_t = np.zeros(1).astype('int32')
     
     def run_one_step(self, vec_in):
         """
@@ -78,11 +78,11 @@ class Ensemble():
                          ((self._n_nets, self._batch_size, self._target_dim)) \
                          .astype('float32')
 
-        # input/output are 3-dim and time/id_idx are 2-dim
+        # input/output (3-dim), time (1-dim), id_idx (2-dim)
         # regardless of step_size or batch_size
         for i, f in enumerate(self._props):
-            output_nbi[i] = f(input_nbi[i][None, :, :], self._time_tb,
+            output_nbi[i] = f(input_nbi[i][None, :, :], self._time_t,
                               self._id_idx_nb[i][None, :])[0]
 
-        self._time_tb[0] += 1.
+        self._time_t[0] += 1
         return output_nbi.reshape(-1)

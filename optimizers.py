@@ -110,8 +110,7 @@ def vanilla_force(options, s_lr, v_grads):
 
 def adadelta_force(options, s_lr, v_grads):
     """
-    Originally from: arXiv:1212.5701
-    Modifications  : https://github.com/KyuyeonHwang/Fractal
+    Adapted with modifications from arXiv:1212.5701
     """
     # Hyperparameters from Fractal are
     # rho = 0.99, e = 1e-20, clip = sqrt(1 / (1 - rho))
@@ -147,9 +146,9 @@ def adadelta_force(options, s_lr, v_grads):
 
 def rmsprop_force(options, s_lr, v_grads):
     """
-    Originally from: http://www.cs.toronto.edu/~tijmen/csc321
-                           /slides/lecture_slides_lec6.pdf
-    Modifications  : https://github.com/KyuyeonHwang/Fractal
+    Adapted with modifications from
+    http://www.cs.toronto.edu/~tijmen/csc321
+          /slides/lecture_slides_lec6.pdf
     """
     # Hyperparameters from Fractal are
     # rho = 0.99, e = 1e-20, clip = sqrt(1 / (1 - rho))
@@ -177,7 +176,7 @@ def rmsprop_force(options, s_lr, v_grads):
 
 def adam_force(options, s_lr, v_grads):
     """
-    Originally from: arXiv:1412.6980
+    Adapted from arXiv:1412.6980
     """
     # Hyperparameters recommended in paper are
     # b1 = 0.9, b2 = 0.999, e = 1e-8

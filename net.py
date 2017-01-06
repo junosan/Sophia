@@ -23,7 +23,7 @@ import theano as th
 import theano.tensor as tt
 
 class Net():
-    def __init__(self, options = None, save_to = None, load_from = None):
+    def __init__(self, options, save_to = None, load_from = None):
         """
         Mode is determined by whether save_to is None or not
         Training:
@@ -83,32 +83,35 @@ class Net():
     def _init_params(self, load_from):
         """
         Instantiate layers and store their learnable parameters
-        and state variables
-        Load parameter values from file if applicable
+        and non-learnable variables (to become th.SharedVariable's below)
+        Load values from file if applicable
         """
         self._params = OrderedDict()
         self._prev_states = OrderedDict() # not learnable
+        self._statistics  = OrderedDict() # not learnable
 
-        def add_states(layer, state_dim):
-            if state_dim <= 0:
-                return
-            self._prev_states[layer.pfx('prev')] = np.zeros \
-                ((self._options['batch_size'], state_dim)).astype('float32')
-            if self._options['learn_init_states']:
-                self._params[layer.pfx('init')] = np.zeros(state_dim) \
-                                                    .astype('float32')
+        def add_nonlearnables(layer, state_dim, stat_dim):
+            if state_dim > 0:
+                self._prev_states[layer.pfx('prev')] = np.zeros \
+                   ((self._options['batch_size'], state_dim)).astype('float32')
+                if self._options['learn_init_states']:
+                    self._params[layer.pfx('init')] = np.zeros(state_dim) \
+                                                        .astype('float32')
+            if stat_dim > 0:
+                self._statistics[layer.pfx('stat')] = np.zeros \
+                    ((self._options['seq_len'], 2, stat_dim)).astype('float32')
 
         if not self._options['learn_id_embedding']:
             add = 0
         else:
             self._id_embedder = FCLayer(self._pfx + 'FC_id_embedder')
-            state_dim = self._id_embedder.add_param \
+            state_dim, stat_dim = self._id_embedder.add_param \
                 (params  = self._params,
                  n_in    = self._options['id_count'],
                  n_out   = self._options['id_embedding_dim'],
                  options = self._options,
                  act     = 'lambda x: x')
-            add_states(self._id_embedder, state_dim)
+            add_nonlearnables(self._id_embedder, state_dim, stat_dim)
             add = self._options['id_embedding_dim']
 
         self._layers = []
@@ -117,33 +120,39 @@ class Net():
         for i in range(D):
             self._layers.append(eval(self._options['unit_type'] + 'Layer') \
                     (self._pfx + self._options['unit_type'] + '_' + str(i)))
-            state_dim = self._layers[i].add_param \
+            state_dim, stat_dim = self._layers[i].add_param \
                 (params  = self._params,
                  n_in    = add + (self._options['net_width'] if i > 0 else \
                                   self._options['input_dim']),
                  n_out   = self._options['net_width'],
                  options = self._options)
-            add_states(self._layers[i], state_dim)
+            add_nonlearnables(self._layers[i], state_dim, stat_dim)
         
         self._layers.append(FCLayer(self._pfx + 'FC_output'))
-        state_dim = self._layers[D].add_param \
+        state_dim, stat_dim = self._layers[D].add_param \
                 (params  = self._params,
                  n_in    = add + self._options['net_width'],
                  n_out   = self._options['target_dim'],
                  options = self._options,
                  act     = 'lambda x: x')
-        add_states(self._layers[D], state_dim)
+        add_nonlearnables(self._layers[D], state_dim, stat_dim)
         
         if load_from is not None:
             len_pfx = len(self._pfx)
+            
             params = np.load(load_from + '/params.npz') # NpzFile object
             for k in self._params.iterkeys():
-                self._params[k] = params[k[len_pfx:]] # no pfx in saved params
+                self._params[k] = params[k[len_pfx :]] # no pfx in saved params
+            
+            if self._options['batch_norm']:
+                stats = np.load(load_from + '/statistics.npz')
+                for k in self._statistics.iterkeys():
+                    self._statistics[k] = stats[k[len_pfx :]]
 
     def _init_shared_variables(self):
         """
         Initialize shared variables from np.ndarray objects for parameters,
-        prev_states, and gradients
+        prev_states, gradients, and statistics (if applicable)
         """
         self._v_params = OrderedDict()
         for k, v in self._params.iteritems():
@@ -157,28 +166,53 @@ class Net():
             self._v_grads = \
                 [th.shared(v * 0., name = k + '_grad') \
                  for k, v in self._params.iteritems()]
+        
+        if self._options['batch_norm']:
+            self._v_statistics = OrderedDict()
+            for k, v in self._statistics.iteritems():
+                self._v_statistics[k] = th.shared(v, name = k)
 
-    def _setup_forward_graph(self, s_input_tbi, s_time_tb, s_id_idx_tb,
-                                   s_next_prev_idx):
+    def _setup_forward_graph(self, s_input_tbi, s_time_t, s_id_idx_tb,
+                                   s_next_prev_idx, is_training = False):
         """
         Specify layer connections
-        Layers return their internal states for next time step as
-            prev_state_update = (v_prev_state, state[s_next_prev_idx])
-        which are collected as a list and returned along with the last
-        layer's output
+        - is_training is relavant only if options['batch_norm']
+        - Layers return their internal states for next time step as
+              prev_state_update = (v_prev_state, state[s_next_prev_idx])
+          which are collected as a list
+        - If options['batch_norm'] and is_training, layers return minibatch
+          statistics 
+              s_stat_tsl    [relative time indices][2][l]
+          which are used to setup updates for exponential averaged statistics
         """
         def get_v_prev_state(layer):
             if layer.pfx('prev') in self._v_prev_states:
                 return self._v_prev_states[layer.pfx('prev')]
             else:
-                return None
+                return tt.alloc(0.)
         
         def get_v_init_state(layer):
             if layer.pfx('prev') in self._v_prev_states \
                     and self._options['learn_init_states']:
                 return self._v_params[layer.pfx('init')]
             else:
-                return None
+                return tt.alloc(0.)
+
+        def get_v_stat_Tsl(layer):
+            if self._options['batch_norm'] \
+                    and layer.pfx('stat') in self._v_statistics \
+                    and is_training == False:
+                return self._v_statistics[layer.pfx('stat')]
+            else:
+                return tt.alloc(0.)
+
+        def setup_stat_update(layer, s_stat_tsl):
+            assert self._options['batch_norm'] and is_training == True
+            rho = self._options['batch_norm_decay']
+            v = self._v_statistics[layer.pfx('stat')]
+            new_v = tt.set_subtensor(v[s_time_t],
+                        rho * v[s_time_t] + (1. - rho) * s_stat_tsl)
+            return (v, new_v)
 
         def to_one_hot(x_tb, n_class):
             # 2-dim -> 3-dim version of tt.extra_ops.to_one_hot
@@ -187,38 +221,46 @@ class Net():
             y = tt.set_subtensor(z[tt.arange(x.shape[0]), x], 1.)
             return tt.reshape(y, (x_tb.shape[0], x_tb.shape[1], n_class))
 
+        prev_state_updates = []
+        stat_updates = []
+
         if not self._options['learn_id_embedding']:
             cat = lambda s_below_tbj: s_below_tbj
         else:
-            s_id_emb_tbi, _ = self._id_embedder.setup_graph \
+            s_id_emb_tbi, _, stat = self._id_embedder.setup_graph \
                 (s_below_tbj     = to_one_hot \
                                       (s_id_idx_tb, self._options['id_count']),
-                 s_time_tb       = s_time_tb,
+                 s_time_t        = s_time_t,
                  s_next_prev_idx = s_next_prev_idx,
                  v_params        = self._v_params,
                  v_prev_state_bk = get_v_prev_state(self._id_embedder),
-                 v_init_state_k  = get_v_init_state(self._id_embedder))
+                 v_init_state_k  = get_v_init_state(self._id_embedder),
+                 v_stat_Tsl      = get_v_stat_Tsl  (self._id_embedder))
             cat = lambda s_below_tbj: tt.concatenate([s_below_tbj,
                                                       s_id_emb_tbi], axis = 2)
+            if stat is not None:
+                stat_updates += [setup_stat_update(self._id_embedder, stat)]
 
         D = self._options['net_depth']
         s_outputs = [None] * (D + 1)  # (RNN) * D + FC
         s_outputs.append(s_input_tbi) # put input at index -1
-        prev_state_updates = []
 
         # vertical stack: input -> layer[0] -> ... -> layer[D - 1] -> output
         for i in range(D + 1):
-            s_outputs[i], update = self._layers[i].setup_graph \
+            s_outputs[i], update, stat = self._layers[i].setup_graph \
                 (s_below_tbj     = cat(s_outputs[i - 1]),
-                 s_time_tb       = s_time_tb,
+                 s_time_t        = s_time_t,
                  s_next_prev_idx = s_next_prev_idx,
                  v_params        = self._v_params,
                  v_prev_state_bk = get_v_prev_state(self._layers[i]),
-                 v_init_state_k  = get_v_init_state(self._layers[i]))
+                 v_init_state_k  = get_v_init_state(self._layers[i]),
+                 v_stat_Tsl      = get_v_stat_Tsl  (self._layers[i]))
             if update is not None:
-                prev_state_updates.append(update)
+                prev_state_updates += [update]
+            if stat is not None:
+                stat_updates += [setup_stat_update(self._layers[i], stat)]
         
-        return s_outputs[D], prev_state_updates
+        return s_outputs[D], prev_state_updates, stat_updates
 
     def _setup_inference_graph(self):
         """
@@ -228,15 +270,15 @@ class Net():
             Updates: _prev_state_updates
         """
         self._port_i_input_tbi = tt.ftensor3(name  = 'port_i_input')
-        self._port_i_time_tb   = tt.fmatrix (name  = 'port_i_time')
+        self._port_i_time_t    = tt.ivector (name  = 'port_i_time')
         self._port_i_id_idx_tb = tt.imatrix (name  = 'port_i_id_idx')
         
         # step_size is a compile time constant for inference
         s_next_prev_idx = tt.alloc(np.int32(self._options['step_size'] - 1))
 
-        self._port_o_output_tbi, self._prev_state_updates = \
+        self._port_o_output_tbi, self._prev_state_updates, _ = \
             self._setup_forward_graph(s_input_tbi     = self._port_i_input_tbi,
-                                      s_time_tb       = self._port_i_time_tb,
+                                      s_time_t        = self._port_i_time_t,
                                       s_id_idx_tb     = self._port_i_id_idx_tb,
                                       s_next_prev_idx = s_next_prev_idx)
 
@@ -292,23 +334,27 @@ class Net():
         Connect graphs together for training and store in/out ports & updates
             Input  : _port_i_input, _port_i_target, _port_i_time,
                      _port_i_id_idx_tb, _port_i_step_size, _port_i_lr, 
-            Output : _port_o_loss
+            Output : _port_o_loss,
+                     _port_o_loss_bnval (for batch_norm validation)
             Updates: _prev_state_updates, _grad_updates,
-                     _optim_state_inits, _param_updates
+                     _optim_state_inits, _param_updates,
+                     _stat_updates, (non-empty only if options['batch_norm'])
+                     _prev_state_updates_bnval (for batch_norm validation)
         """
         self._port_i_input_tbi  = tt.ftensor3(name = 'port_i_input')
         self._port_i_target_tbi = tt.ftensor3(name = 'port_i_target')
-        self._port_i_time_tb    = tt.fmatrix (name = 'port_i_time')
+        self._port_i_time_t     = tt.ivector (name = 'port_i_time')
         self._port_i_id_idx_tb  = tt.imatrix (name = 'port_i_id_idx')
         self._port_i_step_size  = tt.iscalar (name = 'port_i_step_size')
         self._port_i_lr         = tt.fscalar (name = 'port_i_lr')
 
-        s_output_tbi, self._prev_state_updates = \
+        s_output_tbi, self._prev_state_updates, self._stat_updates = \
             self._setup_forward_graph \
                 (s_input_tbi     = self._port_i_input_tbi,
-                 s_time_tb       = self._port_i_time_tb,
+                 s_time_t        = self._port_i_time_t,
                  s_id_idx_tb     = self._port_i_id_idx_tb,
-                 s_next_prev_idx = self._port_i_step_size - 1)
+                 s_next_prev_idx = self._port_i_step_size - 1,
+                 is_training     = True)
 
         self._port_o_loss = self._setup_loss_graph \
                                 (s_output_tbi = s_output_tbi,
@@ -326,43 +372,66 @@ class Net():
                                  v_params = self._v_params.values(),
                                  v_grads  = self._v_grads)
 
+        if self._options['batch_norm']:
+            # validation in batch_norm uses _v_statistics instead of
+            # live statistics, and hence needs a separate graph
+            s_output_tbi_bnval, self._prev_state_updates_bnval, _ = \
+                self._setup_forward_graph \
+                    (s_input_tbi     = self._port_i_input_tbi,
+                     s_time_t        = self._port_i_time_t,
+                     s_id_idx_tb     = self._port_i_id_idx_tb,
+                     s_next_prev_idx = self._port_i_step_size - 1,
+                     is_training     = False)
+
+            self._port_o_loss_bnval = self._setup_loss_graph \
+                                    (s_output_tbi = s_output_tbi_bnval,
+                                     s_target_tbi = self._port_i_target_tbi,
+                                     s_step_size  = self._port_i_step_size)
+
     def compile_f_fwd_propagate(self):
         """
         Compile a callable object of signature
-            (training)  f(input_tbi, target_tbi, time_tb, id_idx_tb) -> loss
-            (inference) f(input_tbi, time_tb, id_idx_tb) -> output_tbi
+            (training)  f(input_tbi, target_tbi, time_t, id_idx_tb) -> loss
+            (inference) f(input_tbi, time_t, id_idx_tb) -> output_tbi
         As a side effect, calling it updates
             _v_prev_states <- _prev_state_updates
         
         NOTE: Output is a list of np.ndarray (i.e., 0-th element is np.ndarray)
         """
+        training_inputs = [self._port_i_input_tbi, self._port_i_target_tbi,
+                           self._port_i_time_t   , self._port_i_id_idx_tb,
+                           self._port_i_step_size]
+        on_unused_input = 'raise' if self._options['learn_clock_params'] \
+                                  or self._options['learn_id_embedding'] \
+                                  else 'ignore'
         if self._is_training:
-            return th.function \
-                (inputs  = [self._port_i_input_tbi, self._port_i_target_tbi,
-                            self._port_i_time_tb  , self._port_i_id_idx_tb,
-                            self._port_i_step_size],
-                 outputs = [self._port_o_loss],
-                 updates = self._prev_state_updates,
-         on_unused_input = 'raise' if self._options['learn_clock_params'] \
-                                   or self._options['learn_id_embedding'] \
-                                   else 'ignore')
+            if not self._options['batch_norm']:
+                return th.function(inputs  = training_inputs,
+                                   outputs = [self._port_o_loss],
+                                   updates = self._prev_state_updates,
+                                   on_unused_input = on_unused_input)
+            else: # batch norm validation
+                return th.function(inputs  = training_inputs,
+                                   outputs = [self._port_o_loss_bnval],
+                                   updates = self._prev_state_updates_bnval,
+                                   on_unused_input = on_unused_input)
         else:
-            return th.function \
-                (inputs  = [self._port_i_input_tbi, self._port_i_time_tb,
-                            self._port_i_id_idx_tb],
-                 outputs = [self._port_o_output_tbi],
-                 updates = self._prev_state_updates,
-         on_unused_input = 'raise' if self._options['learn_clock_params'] \
-                                   or self._options['learn_id_embedding'] \
-                                   else 'ignore')
+            return th.function(inputs  = [self._port_i_input_tbi,
+                                          self._port_i_time_t ,
+                                          self._port_i_id_idx_tb],
+                               outputs = [self._port_o_output_tbi],
+                               updates = self._prev_state_updates,
+                               on_unused_input = on_unused_input)
 
     def compile_f_fwd_bwd_propagate(self):
         """
         Compile a callable object of signature
-            f(input_tbi, target_tbi, time_tb, id_idx_tb) -> loss
+            f(input_tbi, target_tbi, time_t, id_idx_tb) -> loss
         As a side effect, calling it updates
             _v_grads       <- _grad_updates
             _v_prev_states <- _prev_state_updates
+            _v_statistics  <- _stat_updates
+                              (non-empty only if options['batch_norm'])
         
         NOTE: Output is a list of np.ndarray (i.e., 0-th element is np.ndarray)
               To get loss but not update params (for validation),
@@ -371,10 +440,11 @@ class Net():
         assert self._is_training
         return th.function \
             (inputs  = [self._port_i_input_tbi, self._port_i_target_tbi,
-                        self._port_i_time_tb  , self._port_i_id_idx_tb,
+                        self._port_i_time_t  , self._port_i_id_idx_tb,
                         self._port_i_step_size],
              outputs = [self._port_o_loss],
-             updates = self._grad_updates + self._prev_state_updates,
+             updates = (self._grad_updates + self._prev_state_updates
+                        + self._stat_updates),
      on_unused_input = 'raise' if self._options['learn_clock_params'] \
                                or self._options['learn_id_embedding'] \
                                else 'ignore')
@@ -409,56 +479,69 @@ class Net():
                            outputs = [],
                            updates = self._optim_state_inits)
 
-    def save_v_params_to_workspace(self, name = 'params'):
+    def save_to_workspace(self, name = None):
         """
-        Transfer parameters from GPU to file
-        Extension '.npz' appended inside
+        Transfer parameters & statistics (if applicable) from GPU to files
         """
         assert self._is_training
+        sfx = name if name is not None else ''
+
         for k, v_param in self._v_params.iteritems():
-            self._params[k] = v_param.get_value() # pull parameters from GPU
+            self._params[k] = v_param.get_value() # pull from GPU
 
         # There is also savez_compressed, but parameter data
         # doesn't offer much opportunities for compression
-        if name is None:
-            name = 'params'
-        np.savez(self._save_to + '/' + name + '.npz', **self._params)
+        np.savez(self._save_to + '/params' + sfx + '.npz', **self._params)
 
-    def load_v_params_from_workspace(self, name = 'params'):
+        if self._options['batch_norm']:
+            for k, v_stat in self._v_statistics.iteritems():
+                self._statistics[k] = v_stat.get_value()
+
+            np.savez(self._save_to + '/statistics' + sfx + '.npz',
+                     **self._statistics)
+
+    def load_from_workspace(self, name = None):
         """
-        Transfer parameters from file to GPU
-        Extension '.npz' appended inside
+        Transfer parameters & statistics (if applicable) from files to GPU
         """
         assert self._is_training
-        if name is None:
-            name = 'params'
-        params = np.load(self._save_to + '/' + name + '.npz') # NpzFile object
+        sfx = name if name is not None else ''
+        
+        # ret = NpzFile object
+        params = np.load(self._save_to + '/params' + sfx + '.npz')
         for k, v_param in self._v_params.iteritems():
-            v_param.set_value(params[k]) # push parameters to GPU
+            v_param.set_value(params[k]) # push to GPU
+        
+        if self._options['batch_norm']:
+            statistics = np.load(self._save_to + '/statistics' + sfx + '.npz')
+            for k, v_stat in self._v_statistics.iteritems():
+                v_stat.set_value(statistics[k])
     
-    def remove_params_file_from_workspace(self, name = 'params'):
+    def remove_from_workspace(self, name = None):
         """
-        Remove temporary file from the workspace
-        Extension '.npz' appended inside
+        Remove temporary files from the workspace
         """
         assert self._is_training
-        if name is None:
-            name = 'params'
-        os.remove(self._save_to + '/' + name + '.npz')
+        sfx = name if name is not None else ''
+
+        os.remove(self._save_to + '/params' + sfx + '.npz')
+
+        if self._options['batch_norm']:
+            os.remove(self._save_to + '/statistics' + sfx + '.npz')
     
     def dimensions(self):
-        """
-        Intended for use during inference
-        """
         return self._options['input_dim'], self._options['target_dim']
     
-    def save_param(self, param_name, filename):
+    def n_weights(self):
+        return sum(p.size for p in self._params.itervalues())
+
+    def save_param(self, param_name, file_name):
         """
         Save an individual parameter to file (intended for debugging)
         Cannot be used during training as _params is not updated unless
-        save_v_params_to_workspace is called during training
+        save_to_workspace is called during training
         """
         assert not self._is_training and \
                self._pfx + param_name in self._params
-        np.savez(filename,
+        np.savez(file_name,
                  **{ param_name : self._params[self._pfx + param_name] })

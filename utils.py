@@ -13,13 +13,10 @@ import theano as th
 import theano.tensor as tt
 
 def SE_loss(s_output_tbi, s_target_tbi):
-    # To match Fractal:
-    #     use SE rather than MSE
-    #     average in tb dimensions (but not in i dimension) for display
-    #     factor of 1 / 2 (removed after testing)
+    # To display as MSE, average in tb dimensions (but not in i dimension)
     return tt.sum(tt.sqr(s_output_tbi - s_target_tbi))
 
-# In the future, maybe add cross entropy loss, softmax activation, etc
+# In the future, maybe add cross entropy loss, etc
 
 def clip_norm(s_tensor, threshold):
     """
@@ -29,7 +26,8 @@ def clip_norm(s_tensor, threshold):
     assert threshold > 0.
     normsq = tt.sum(tt.sqr(s_tensor))
     return tt.switch(normsq > (threshold ** 2),
-                     s_tensor / tt.sqrt(normsq) * threshold, s_tensor)
+                     s_tensor / tt.sqrt(normsq) * threshold,
+                     s_tensor)
 
 def clip_elem(s_tensor, threshold):
     """
@@ -37,14 +35,12 @@ def clip_elem(s_tensor, threshold):
         threshold > 0.
     """
     assert threshold > 0.
-    # return tt.minimum(threshold, tt.maximum(-threshold, s_tensor))
     return tt.clip(s_tensor, -threshold, threshold)
 
 # Weight initializers
 # Needs modification if used for ReLU or leaky ReLU nonlinearities:
 #     http://lasagne.readthedocs.io/en/latest/modules/init.html
 
-# scale = 0.1 is roughly sqrt(6)/sqrt(1024) (in line with Xavier init)
 def unif_weight(options, n_in, n_out = None):
     """
     Uniform initalization from [-scale, scale)
@@ -76,6 +72,7 @@ def ortho_weight(dim):
             pass # suppress probalistic failure
     return U.astype('float32')
 
+# cf. unif_weight with scale = 0.1 is sqrt(6) / sqrt(600)
 def xavier_weight(n_in, n_out):
     """
     Xavier init
