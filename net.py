@@ -75,7 +75,7 @@ class Net():
                 self._options = pk.load(f)
             
             assert 'step_size' in options and 'batch_size' in options
-            # to set next_prev_idx = window_size - 1
+            # to set next prev_state as state[window_size - d : window_size]
             self._options['window_size'] = options['step_size']
             self._options['step_size']   = options['step_size']
             self._options['batch_size']  = options['batch_size']
@@ -84,23 +84,27 @@ class Net():
         """
         Instantiate layers and store their learnable parameters
         and non-learnable variables (to become th.SharedVariable's below)
-        Load values from file if applicable
+        Load values from files if applicable
         """
         self._params = OrderedDict()
         self._prev_states = OrderedDict() # not learnable
         self._statistics  = OrderedDict() # not learnable
 
-        def add_nonlearnables(layer, state_dim, stat_dim):
+        def add_nonlearnables(layer, state_dim, stat_dim, delay = 0):
             if state_dim > 0:
+                assert delay > 0
                 self._prev_states[layer.pfx('prev')] = np.zeros \
-                   ((self._options['batch_size'], state_dim)).astype('float32')
+                    ((delay, self._options['batch_size'], state_dim)) \
+                    .astype('float32') # prev_state_dbk
                 if self._options['learn_init_states']:
-                    self._params[layer.pfx('init')] = np.zeros(state_dim) \
-                                                        .astype('float32')
+                    self._params[layer.pfx('init')] = np.zeros \
+                        ((delay, state_dim)).astype('float32') # init_state_dk
             if stat_dim > 0:
                 self._statistics[layer.pfx('stat')] = np.zeros \
                     ((self._options['seq_len'], 2, stat_dim)).astype('float32')
 
+
+        # optional ID embedder
         if not self._options['learn_id_embedding']:
             add = 0
         else:
@@ -114,9 +118,16 @@ class Net():
             add_nonlearnables(self._id_embedder, state_dim, stat_dim)
             add = self._options['id_embedding_dim']
 
+
+        # main recurrent layers
         self._layers = []
         D = self._options['net_depth']
         assert D > 0
+
+        delays = map(int, self._options['layer_delays'].split(';')) \
+                 if 'layer_delays' in self._options else [1] * D
+        assert len(delays) == D
+
         for i in range(D):
             self._layers.append(eval(self._options['unit_type'] + 'Layer') \
                     (self._pfx + self._options['unit_type'] + '_' + str(i)))
@@ -125,9 +136,12 @@ class Net():
                  n_in    = add + (self._options['net_width'] if i > 0 else \
                                   self._options['input_dim']),
                  n_out   = self._options['net_width'],
-                 options = self._options)
-            add_nonlearnables(self._layers[i], state_dim, stat_dim)
+                 options = self._options,
+                 delay   = delays[i])
+            add_nonlearnables(self._layers[i], state_dim, stat_dim, delays[i])
         
+
+        # final FCLayer for dimension compression
         self._layers.append(FCLayer(self._pfx + 'FC_output'))
         state_dim, stat_dim = self._layers[D].add_param \
                 (params  = self._params,
@@ -137,6 +151,7 @@ class Net():
                  act     = 'lambda x: x')
         add_nonlearnables(self._layers[D], state_dim, stat_dim)
         
+
         if load_from is not None:
             len_pfx = len(self._pfx)
             
@@ -173,12 +188,13 @@ class Net():
                 self._v_statistics[k] = th.shared(v, name = k)
 
     def _setup_forward_graph(self, s_input_tbi, s_time_t, s_id_idx_tb,
-                                   s_next_prev_idx, is_training = False):
+                                   s_step_size, is_training = False):
         """
         Specify layer connections
         - is_training is relavant only if options['batch_norm']
-        - Layers return their internal states for next time step as
-              prev_state_update = (v_prev_state, state[s_next_prev_idx])
+        - Layers return their internal states to be used for next time step as
+              prev_state_update = \
+                (v_prev_state, state[s_step_size - d : s_step_size])
           which are collected as a list
         - If options['batch_norm'] and is_training, layers return minibatch
           statistics 
@@ -230,12 +246,12 @@ class Net():
             s_id_emb_tbi, _, stat = self._id_embedder.setup_graph \
                 (s_below_tbj     = to_one_hot \
                                       (s_id_idx_tb, self._options['id_count']),
-                 s_time_t        = s_time_t,
-                 s_next_prev_idx = s_next_prev_idx,
-                 v_params        = self._v_params,
-                 v_prev_state_bk = get_v_prev_state(self._id_embedder),
-                 v_init_state_k  = get_v_init_state(self._id_embedder),
-                 v_stat_Tsl      = get_v_stat_Tsl  (self._id_embedder))
+                 s_time_t         = s_time_t,
+                 s_step_size      = s_step_size,
+                 v_params         = self._v_params,
+                 v_prev_state_dbk = get_v_prev_state(self._id_embedder),
+                 v_init_state_dk  = get_v_init_state(self._id_embedder),
+                 v_stat_Tsl       = get_v_stat_Tsl  (self._id_embedder))
             cat = lambda s_below_tbj: tt.concatenate([s_below_tbj,
                                                       s_id_emb_tbi], axis = 2)
             if stat is not None:
@@ -248,13 +264,13 @@ class Net():
         # vertical stack: input -> layer[0] -> ... -> layer[D - 1] -> output
         for i in range(D + 1):
             s_outputs[i], update, stat = self._layers[i].setup_graph \
-                (s_below_tbj     = cat(s_outputs[i - 1]),
-                 s_time_t        = s_time_t,
-                 s_next_prev_idx = s_next_prev_idx,
-                 v_params        = self._v_params,
-                 v_prev_state_bk = get_v_prev_state(self._layers[i]),
-                 v_init_state_k  = get_v_init_state(self._layers[i]),
-                 v_stat_Tsl      = get_v_stat_Tsl  (self._layers[i]))
+                (s_below_tbj      = cat(s_outputs[i - 1]),
+                 s_time_t         = s_time_t,
+                 s_step_size      = s_step_size,
+                 v_params         = self._v_params,
+                 v_prev_state_dbk = get_v_prev_state(self._layers[i]),
+                 v_init_state_dk  = get_v_init_state(self._layers[i]),
+                 v_stat_Tsl       = get_v_stat_Tsl  (self._layers[i]))
             if update is not None:
                 prev_state_updates += [update]
             if stat is not None:
@@ -274,13 +290,13 @@ class Net():
         self._port_i_id_idx_tb = tt.imatrix (name  = 'port_i_id_idx')
         
         # step_size is a compile time constant for inference
-        s_next_prev_idx = tt.alloc(np.int32(self._options['step_size'] - 1))
+        s_step_size = tt.alloc(np.int32(self._options['step_size']))
 
         self._port_o_output_tbi, self._prev_state_updates, _ = \
-            self._setup_forward_graph(s_input_tbi     = self._port_i_input_tbi,
-                                      s_time_t        = self._port_i_time_t,
-                                      s_id_idx_tb     = self._port_i_id_idx_tb,
-                                      s_next_prev_idx = s_next_prev_idx)
+            self._setup_forward_graph(s_input_tbi = self._port_i_input_tbi,
+                                      s_time_t    = self._port_i_time_t,
+                                      s_id_idx_tb = self._port_i_id_idx_tb,
+                                      s_step_size = s_step_size)
 
     def _setup_loss_graph(self, s_output_tbi, s_target_tbi, s_step_size):
         """
@@ -350,11 +366,11 @@ class Net():
 
         s_output_tbi, self._prev_state_updates, self._stat_updates = \
             self._setup_forward_graph \
-                (s_input_tbi     = self._port_i_input_tbi,
-                 s_time_t        = self._port_i_time_t,
-                 s_id_idx_tb     = self._port_i_id_idx_tb,
-                 s_next_prev_idx = self._port_i_step_size - 1,
-                 is_training     = True)
+                (s_input_tbi = self._port_i_input_tbi,
+                 s_time_t    = self._port_i_time_t,
+                 s_id_idx_tb = self._port_i_id_idx_tb,
+                 s_step_size = self._port_i_step_size,
+                 is_training = True)
 
         self._port_o_loss = self._setup_loss_graph \
                                 (s_output_tbi = s_output_tbi,
@@ -377,11 +393,11 @@ class Net():
             # live statistics, and hence needs a separate graph
             s_output_tbi_bnval, self._prev_state_updates_bnval, _ = \
                 self._setup_forward_graph \
-                    (s_input_tbi     = self._port_i_input_tbi,
-                     s_time_t        = self._port_i_time_t,
-                     s_id_idx_tb     = self._port_i_id_idx_tb,
-                     s_next_prev_idx = self._port_i_step_size - 1,
-                     is_training     = False)
+                    (s_input_tbi = self._port_i_input_tbi,
+                     s_time_t    = self._port_i_time_t,
+                     s_id_idx_tb = self._port_i_id_idx_tb,
+                     s_step_size = self._port_i_step_size,
+                     is_training = False)
 
             self._port_o_loss_bnval = self._setup_loss_graph \
                                     (s_output_tbi = s_output_tbi_bnval,

@@ -34,6 +34,7 @@ def main():
     options['lstm_peephole']      = True
     options['net_width']          = 512
     options['net_depth']          = 12
+    # options['layer_delays']       = '1;1;1;2;2;2;4;4;4;8;8;1'
     options['batch_size']         = 128
     options['window_size']        = 128
     options['step_size']          = 64
@@ -103,10 +104,10 @@ def main():
     print('Stats')
     seed = np.random.randint(np.iinfo(np.int32).max)
     np.random.seed(seed)
-    print('    Random seed     : ' + str(seed).rjust(10))
+    print('    random seed     : ' + str(seed).rjust(10))
 
     # store sequence length
-    print('    Sequence length : ', end = '')
+    print('    sequence length : ', end = '')
     options['seq_len'] = check_seq_len(args.data_dir + '/train.list',
                                        options['input_dim'],
                                        options['target_dim'])
@@ -256,8 +257,8 @@ def main():
         print('Total discarded frames : '
               + str(total_discarded_frames).rjust(12))
 
-        print('Train set loss : %.6f' % loss_train)
-        print('Dev set loss   : %.6f' % loss_cur, end = '')
+        print('Train loss : %.6f' % loss_train)
+        print('Eval loss  : %.6f' % loss_cur, end = '')
 
         if np.isnan(loss_cur):
             loss_cur = np.float32('inf')
@@ -328,9 +329,9 @@ def main():
     print('Total discarded frames : ' + str(total_discarded_frames).rjust(12))
 
     loss_train = run_epoch(train_data, None)
-    print('Train set loss : %.6f' % loss_train)
+    print('[Train set] Loss : %.6f' % loss_train)
     loss_dev = run_epoch(dev_data, None)
-    print('Dev set loss   : %.6f' % loss_dev)
+    print('[ Dev set ] Loss : %.6f' % loss_dev)
     print('')
     
 if __name__ == '__main__':

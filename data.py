@@ -15,10 +15,10 @@ Iterator class for time slices of shuffled sequence minibatches
 - For unroll_scan option to work in Net, window_size must be a compile time
   constant and hence cannot be changed once a Net is instantiated
 
-- Sequences are assumed to be of same lengths; this limitation can be lifted
-  in general by giving each sequence in minibatch independent time flows, but
-  batch_norm requires synchronized time, hence requiring same length (unless
-  data is padded, which may not always be applicable)
+- Sequences are assumed to be of same lengths; this limitation can in general
+  be lifted easily by giving each sequence in minibatch independent time flows,
+  but batch_norm requires synchronized time, hence requiring same length
+  (unless data is padded, which may not always be applicable)
 - Sequences are each given an id_idx to be used as an one-hot encoding index
   if an ID can be associated with a sequence (may be ignored if irrelevant)
 
@@ -31,9 +31,11 @@ Iterator class for time slices of shuffled sequence minibatches
       time      int32       [window_size]
       id_idx    int32       [window_size][batch_size]
   randomly shuffled in 1-th (batch) dimension
-- Time starts at 0 and increases by 1 each time index; 0 signals state reset
 - Call discard_unfinished to use new sequences next iteration
 - Unless stopped explicitly inside the loop, iterates indefinitely
+
+- Time starts at 0 and increases by 1 each time index
+- For a layer with delay d, time < d signals state reset
 
 - Upon each iteration, 
     - Previous arrays are shifted by step_size to the left in time dimension

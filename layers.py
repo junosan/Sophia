@@ -47,6 +47,8 @@ class Layer():
         - By adding learnable parameters as params[pfx(name)], expect
             v_params[pfx(name)]     (same dimensions as params[pfx(name)])
           to be provided in setup_graph
+        - For recurrent layers with states, expect delay (d) to be passed
+          via kwargs; if not, default to d = 1
         - Return values determine the last dimension of non-learnable 
           th.SharedVariable's used in setup_graph:
               k = state_dim (> 0 for recurrent layers with states)
@@ -56,44 +58,46 @@ class Layer():
         pass
     
     @abstractmethod
-    def setup_graph(self, s_below_tbj, s_time_t, s_next_prev_idx,
-                    v_params, v_prev_state_bk, v_init_state_k, v_stat_Tsl):
+    def setup_graph(self, s_below_tbj, s_time_t, s_step_size,
+                    v_params, v_prev_state_dbk, v_init_state_dk, v_stat_Tsl):
         """
         Connect input nodes to outputs, prepare prev_state_update for the
         next time step, and report batch statistics (if applicable)
 
         Inputs:
-            s_below_tbj     symbolic          [n_steps][batch_size][n_in]
-            s_time_t        symbolic          [n_steps] (int32 index)
-            s_next_prev_idx symbolic          scalar    (int32 index)
-            v_params        OrderedDict       { str : th.SharedVariable }
-            v_prev_state_bk th.SharedVariable [batch_size][state_dim]
-                            tt.alloc(0.)      (if state_dim == 0)
-            v_init_state_k  th.SharedVariable [state_dim]
-                                              (if options['learn_init_states'])
-                            tt.alloc(0.)      (if not above or state_dim == 0)
-            v_stat_Tsl      th.SharedVariable [seq_len][2][stat_dim]
-                                              (if options['batch_norm'] and
-                                               in inference mode)
-                                              (absolute time index)
-                            tt.alloc(0.)      (if not above or stat_dim == 0)
+            s_below_tbj      symbolic          [n_steps][batch_size][n_in]
+            s_time_t         symbolic          [n_steps] (int32 index)
+            s_step_size      symbolic          scalar    (int32 index)
+            v_params         OrderedDict       { str : th.SharedVariable }
+            v_prev_state_dbk th.SharedVariable [delay][batch_size][state_dim]
+                             tt.alloc(0.)      (if state_dim == 0)
+            v_init_state_dk  th.SharedVariable [delay][state_dim]
+                                               (options['learn_init_states'])
+                             tt.alloc(0.)      (if not above or state_dim == 0)
+            v_stat_Tsl       th.SharedVariable [seq_len][2][stat_dim]
+                                               (options['batch_norm'] and
+                                                in inference mode)
+                                               (absolute time index)
+                             tt.alloc(0.)      (if not above or stat_dim == 0)
         Returns:
             tuple of 
                 s_output_tbi, prev_state_update, s_stat_tsl
             where prev_state_update =
-                (v_prev_state_bk, state[s_next_prev_idx]) (if state_dim > 0)
-                None                                      (if state_dim == 0)
+                (v_prev_state_dbk, state[s_step_size - d : s_step_size])
+                                                            (if state_dim > 0)
+                None                                        (if state_dim == 0)
             and s_stat_tsl =
                 bn_train stats (if options['batch_norm'] and in training mode)
                                (relative time index)
                 None           (if not above or stat_dim == 0)
         
-        - If state_dim > 0, v_prev_state_bk holds the state right before
-          the 0-th time index of this time step
-        - If state_dim > 0, step function should use tt.switch to pick
-              states from (time index - 1)  (if time index > 0)
-              s_init_state_k                (else)
-          as the state values carried from (time index - 1)
+        - If state_dim > 0:
+            * v_prev_state_dbk holds the state up to d time indices before
+              the 0-th time index of this time step, oldest in leftmost index
+            * step function should use absolute time to pick
+                  states_d_time_indices_before   (if time >= d)
+                  s_init_state_dk[time]          (else)
+              as the previous state for feedback
         - If stat_dim > 0 and in inference mode, use v_stat_Tsl[time] as
           normalization statistics (handled automatically by bn function)
         - Receiving side should check if prev_state_update or s_stat_tsl
@@ -176,8 +180,8 @@ class FCLayer(Layer):
         
         return 0, 0 # state [], stat []
 
-    def setup_graph(self, s_below_tbj, s_time_t, s_next_prev_idx,
-                    v_params, v_prev_state_bk, v_init_state_k, v_stat_Tsl):
+    def setup_graph(self, s_below_tbj, s_time_t, s_step_size,
+                    v_params, v_prev_state_dbk, v_init_state_dk, v_stat_Tsl):
         v_param = lambda name: v_params[self.pfx(name)]
 
         h_tbi = self._act(tt.dot(s_below_tbj, v_param('W')) + v_param('b'))
@@ -195,10 +199,11 @@ class LSTMLayer(Layer):
     def add_param(self, params, n_in, n_out, options, **kwargs):
         self.n_steps        = options['window_size']
         self.n_out          = n_out
+        self.delay          = kwargs['delay'] if 'delay' in kwargs else 1
         self.use_peephole   = options['lstm_peephole']
         self.use_batch_norm = options['batch_norm']
         self.use_input_bias = not self.use_batch_norm
-        self.max_time_idx   = options['seq_len'] - 1
+        self.max_time       = options['seq_len'] - 1
         self.use_clock      = options['learn_clock_params']
         self.use_res_gate   = options['residual_gate'] and n_in == n_out
         self.unroll_scan    = options['unroll_scan']
@@ -231,21 +236,23 @@ class LSTMLayer(Layer):
         # state [h[1], c[1]], stat [x[4], h[4], c[1]] (if applicable)
         return 2 * n_out, (9 * n_out if self.use_batch_norm else 0)
 
-    def setup_graph(self, s_below_tbj, s_time_t, s_next_prev_idx,
-                    v_params, v_prev_state_bk, v_init_state_k, v_stat_Tsl):
+    def setup_graph(self, s_below_tbj, s_time_t, s_step_size,
+                    v_params, v_prev_state_dbk, v_init_state_dk, v_stat_Tsl):
         v_param  = lambda name: v_params[self.pfx(name)]
         n_out    = self.n_out
-        max_time = self.max_time_idx
+        d        = self.delay
+        max_time = self.max_time
 
         W_j4i  = v_param('W')
         b_4i   = v_param('b') if self.use_input_bias else 0.
         x_tb4i = tt.dot(s_below_tbj, W_j4i) + b_4i
 
-        init_hc_2i = v_init_state_k
-        U_i4i      = v_param('U')
-        p_3i       = v_param('p') if self.use_peephole else \
-                     tt.zeros(3 * n_out).astype('float32')
-        non_seqs = [init_hc_2i, U_i4i, p_3i]
+        init_hc_d2i = v_init_state_dk if v_init_state_dk.ndim > 0 else \
+                      tt.zeros((d, 2 * n_out)).astype('float32')
+        U_i4i       = v_param('U')
+        p_3i        = v_param('p') if self.use_peephole else \
+                      tt.zeros(3 * n_out).astype('float32')
+        non_seqs    = [init_hc_d2i, U_i4i, p_3i]
 
         mask_ti = self.setup_clock_graph \
                       (s_time_t, v_param('clk_t'), v_param('clk_s')) \
@@ -265,7 +272,9 @@ class LSTMLayer(Layer):
         bn_training = self.use_batch_norm and v_stat_Tsl.ndim == 0
 
         def step(x_b4i, time, mask_i, prev_hc_b2i, *args):
-            prev_hc_b2i = tt.switch(time > 0, prev_hc_b2i, init_hc_2i)
+            prev_hc_b2i = tt.switch(time >= d, prev_hc_b2i,
+                                    init_hc_d2i[tt.minimum(time, d - 1)]
+                                    if d > 1 else init_hc_d2i[0])
             prev_h_bi = cut1(prev_hc_b2i, 0, n_out)
             prev_c_bi = cut1(prev_hc_b2i, 1, n_out)
             
@@ -303,26 +312,30 @@ class LSTMLayer(Layer):
                                     axis = 1) \
                      if bn_training else tt.alloc(0.)))
 
-        # hc_stat = [hc_tb2i, stat_tsl]
         if not self.unroll_scan:
-            hc_stat, _ = th.scan(step,
-                                 sequences     = [x_tb4i, s_time_t, mask_ti],
-                                 outputs_info  = [v_prev_state_bk, None],
-                                 non_sequences = non_seqs,
-                                 n_steps       = self.n_steps,
-                                 name          = self.pfx('scan'),
-                                 strict        = True)
+            # th.scan requires contracted dimension for d == 1
+            init = v_prev_state_dbk if d > 1 else v_prev_state_dbk[0]
+            ((hc_tb2i, stat_tsl), _) = th.scan(step,
+                            sequences     = [x_tb4i, s_time_t, mask_ti],
+                            outputs_info  = [dict(initial = init,
+                                                  taps    = [-d]),
+                                             None],
+                            non_sequences = non_seqs,
+                            n_steps       = self.n_steps,
+                            name          = self.pfx('scan'),
+                            strict        = True)
         else:
-            hc_list   = [v_prev_state_bk]
-            stat_list = [None]
+            hc_list   = [v_prev_state_dbk[t] for t in range(d)]
+            stat_list = [None] * d
             for t in range(self.n_steps):
                 hc_b2i, stat_sl = step(below_tb4i[t], s_time_t[t], mask_ti[t],
-                                       hc_list[-1], *non_seqs)
+                                       hc_list[-d], *non_seqs)
                 hc_list.append(hc_b2i)
                 stat_list.append(stat_sl)
-            hc_stat = [tt.stack(hc_list[1 :]), tt.stack(stat_list[1 :])]
+            hc_tb2i  = tt.stack(hc_list[d :])
+            stat_tsl = tt.stack(stat_list[d :])
 
-        h_tbi = hc_stat[0][:, :, : n_out]
+        h_tbi = hc_tb2i[:, :, : n_out]
         if not self.use_res_gate:
             out_tbi = h_tbi
         else:
@@ -330,17 +343,18 @@ class LSTMLayer(Layer):
             out_tbi = g_i * h_tbi + (1. - g_i) * s_below_tbj
 
         return (out_tbi,
-                (v_prev_state_bk, hc_stat[0][s_next_prev_idx]),
-                (hc_stat[1] if bn_training else None))
+                (v_prev_state_dbk, hc_tb2i[s_step_size - d : s_step_size]),
+                (stat_tsl if bn_training else None))
 
 
 class GRULayer(Layer):
     def add_param(self, params, n_in, n_out, options, **kwargs):
         self.n_steps        = options['window_size']
         self.n_out          = n_out
+        self.delay          = kwargs['delay'] if 'delay' in kwargs else 1
         self.use_batch_norm = options['batch_norm']
         self.use_input_bias = not self.use_batch_norm
-        self.max_time_idx   = options['seq_len'] - 1
+        self.max_time       = options['seq_len'] - 1
         self.use_clock      = options['learn_clock_params']
         self.use_res_gate   = options['residual_gate'] and n_in == n_out
         self.unroll_scan    = options['unroll_scan']
@@ -370,19 +384,20 @@ class GRULayer(Layer):
         # state [h[1]], stat [x[2], h[2], xc[1], hc[1]] (if applicable)
         return n_out, (6 * n_out if self.use_batch_norm else 0)
 
-    def setup_graph(self, s_below_tbj, s_time_t, s_next_prev_idx,
-                    v_params, v_prev_state_bk, v_init_state_k, v_stat_Tsl):
+    def setup_graph(self, s_below_tbj, s_time_t, s_step_size,
+                    v_params, v_prev_state_dbk, v_init_state_dk, v_stat_Tsl):
         v_param  = lambda name: v_params[self.pfx(name)]
         n_out    = self.n_out
-        max_time = self.max_time_idx
+        max_time = self.max_time
 
         W_j3i  = v_param('W')
         b_3i   = v_param('b') if self.use_input_bias else 0.
         x_tb3i = tt.dot(s_below_tbj, W_j3i) + b_3i
 
-        init_h_i = v_init_state_k
-        U_i3i    = v_param('U')
-        non_seqs = [init_h_i, U_i3i]
+        init_h_di = v_init_state_dk if v_init_state_dk.ndim > 0 else \
+                    tt.zeros((d, n_out)).astype('float32')
+        U_i3i     = v_param('U')
+        non_seqs  = [init_h_di, U_i3i]
 
         mask_ti = self.setup_clock_graph \
                       (s_time_t, v_param('clk_t'), v_param('clk_s')) \
@@ -406,7 +421,9 @@ class GRULayer(Layer):
         bn_training = self.use_batch_norm and v_stat_Tsl.ndim == 0
 
         def step(x_b3i, time, mask_i, prev_h_bi, *args):
-            prev_h_bi = tt.switch(time > 0, prev_h_bi, init_h_i)
+            prev_h_bi = tt.switch(time >= d, prev_h_bi,
+                                  init_h_di[tt.minimum(time, d - 1)]
+                                  if d > 1 else init_h_di[0])
             
             x_b2i = cut1(x_b3i, 0, 2 * n_out)
             h_b2i = tt.dot(prev_h_bi, cut1(U_i3i, 0, 2 * n_out))
@@ -437,24 +454,29 @@ class GRULayer(Layer):
                                           stat_xc_si, stat_hc_si], axis = 1) \
                           if bn_training else tt.alloc(0.))
 
-        # h_stat = [h_tbi, stat_tsl]
         if not self.unroll_scan:
-            h_stat, _ = th.scan(step,
-                                sequences     = [x_tb3i, s_time_t, mask_ti],
-                                outputs_info  = [v_prev_state_bk, None],
-                                non_sequences = non_seqs,
-                                n_steps       = n_steps,
-                                name          = self.pfx('scan'),
-                                strict        = True)
+            # th.scan requires contracted dimension for d == 1
+            init = v_prev_state_dbk if d > 1 else v_prev_state_dbk[0]
+            ((h_tbi, stat_tsl), _) = th.scan(step,
+                            sequences     = [x_tb3i, s_time_t, mask_ti],
+                            outputs_info  = [dict(initial = init,
+                                                  taps    = [-d]),
+                                             None],
+                            non_sequences = non_seqs,
+                            n_steps       = n_steps,
+                            name          = self.pfx('scan'),
+                            strict        = True)
         else:
-            h_list    = [v_prev_state_bk]
-            stat_list = [None]
+            h_list    = [v_prev_state_dbk[t] for t in range(d)]
+            stat_list = [None] * d
             for t in range(self.n_steps):
                 h_bi, stat_sl = step(x_tb3i[t], s_time_t[t], mask_ti[t],
-                                     h_list[-1], *non_seqs)
-            h_stat = [tt.stack(h_list[1 :]), tt.stack(stat_list[1 :])]
+                                     h_list[-d], *non_seqs)
+                h_list.append(h_bi)
+                stat_list.append(stat_sl)
+            h_tbi    = tt.stack(h_list[d :])
+            stat_tsl = tt.stack(stat_list[d :])
         
-        h_tbi = h_stat[0]
         if not self.use_res_gate:
             out_tbi = h_tbi
         else:
@@ -462,5 +484,5 @@ class GRULayer(Layer):
             out_tbi = g_i * h_tbi + (1. - g_i) * s_below_tbj
 
         return (out_tbi,
-                (v_prev_state_bk, h_tbi[s_next_prev_idx]),
-                (hc_stat[1] if bn_training else None))
+                (v_prev_state_dbk, h_tbi[s_step_size - d : s_step_size]),
+                (stat_tsl if bn_training else None))

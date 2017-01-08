@@ -8,7 +8,7 @@
 
 # Introduction
 Sophia (Greek for "wisdom") is based on Theano and focuses on testing 
-experimental recurrent neural network architectures  for regression tasks on
+experimental recurrent neural network architectures for regression tasks on
 long and noisy inputs.
 
 Notable features:
