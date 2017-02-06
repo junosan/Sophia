@@ -1,41 +1,47 @@
-#==========================================================================#
-# Copyright (C) 2016 Hosang Yoon (hosangy@gmail.com) - All Rights Reserved #
-# Unauthorized copying of this file, via any medium is strictly prohibited #
-#                       Proprietary and confidential                       #
-#==========================================================================#
+#   Copyright 2017 Hosang Yoon
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
 
 """
 Small helper functions
 """
 
+from __future__ import absolute_import, division, print_function
+
 import numpy as np
 import theano as th
 import theano.tensor as tt
+import string
+import random
 
-def SE_loss(s_output_tbi, s_target_tbi):
-    # To display as MSE, average in tb dimensions (but not in i dimension)
-    return tt.sum(tt.sqr(s_output_tbi - s_target_tbi))
+# Loss functions
+# For display, average in tb dimensions (but not in i dimension)
 
-# In the future, maybe add cross entropy loss, etc
+def l2_loss(s_output_tbi, s_target_tbi):
+    # D_err[loss] = err
+    return tt.sum(tt.sqr(s_output_tbi - s_target_tbi) / 2.)
 
-def clip_norm(s_tensor, threshold):
-    """
-    Rescale given tensor to have norm at most equal to threshold
-        threshold > 0.
-    """
-    assert threshold > 0.
-    normsq = tt.sum(tt.sqr(s_tensor))
-    return tt.switch(normsq > (threshold ** 2),
-                     s_tensor / tt.sqrt(normsq) * threshold,
-                     s_tensor)
+def l1_loss(s_output_tbi, s_target_tbi):
+    # D_err[loss] = sgn(err)
+    return tt.sum(tt.abs(s_output_tbi - s_target_tbi))
 
-def clip_elem(s_tensor, threshold):
-    """
-    Elementwise clipping to +-threshold
-        threshold > 0.
-    """
-    assert threshold > 0.
-    return tt.clip(s_tensor, -threshold, threshold)
+def huber_loss(s_output_tbi, s_target_tbi, delta):
+    # D_err[loss] = clip_elem(err, delta)
+    assert delta > 0.
+    a = tt.abs(s_output_tbi - s_target_tbi)
+    return tt.sum(tt.switch(a <= delta, tt.sqr(a) / 2.,
+                                        delta * (a - delta / 2.)))
+
 
 # Weight initializers
 # Needs modification if used for ReLU or leaky ReLU nonlinearities:
@@ -72,7 +78,6 @@ def ortho_weight(dim):
             pass # suppress probalistic failure
     return U.astype('float32')
 
-# cf. unif_weight with scale = 0.1 is sqrt(6) / sqrt(600)
 def xavier_weight(n_in, n_out):
     """
     Xavier init
@@ -84,8 +89,29 @@ def xavier_weight(n_in, n_out):
     return W.astype('float32')
 
 
-import string
-import random
+# Weight clipping
+
+def clip_norm(s_tensor, threshold):
+    """
+    Rescale given tensor to have norm at most equal to threshold
+        threshold > 0.
+    """
+    assert threshold > 0.
+    normsq = tt.sum(tt.sqr(s_tensor))
+    return tt.switch(normsq > (threshold ** 2),
+                     s_tensor / tt.sqrt(normsq) * threshold,
+                     s_tensor)
+
+def clip_elem(s_tensor, threshold):
+    """
+    Elementwise clipping to +-threshold
+        threshold > 0.
+    """
+    assert threshold > 0.
+    return tt.clip(s_tensor, -threshold, threshold)
+
+
+# For avoiding name clash
 
 def get_random_string(length = 8):
     return ''.join(random.SystemRandom().choice(string.ascii_uppercase

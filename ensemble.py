@@ -1,8 +1,16 @@
-#==========================================================================#
-# Copyright (C) 2016 Hosang Yoon (hosangy@gmail.com) - All Rights Reserved #
-# Unauthorized copying of this file, via any medium is strictly prohibited #
-#                       Proprietary and confidential                       #
-#==========================================================================#
+#   Copyright 2017 Hosang Yoon
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
 
 """
 Class for fwd propagating pre-trained nets in ensemble, one step at a time 
@@ -11,6 +19,8 @@ Class for fwd propagating pre-trained nets in ensemble, one step at a time
   and/or different id_idx orders)
 - Hence, receive and return data for all nets separately 
 """
+
+from __future__ import absolute_import, division, print_function
 
 import numpy as np
 from net import Net
@@ -44,7 +54,7 @@ class Ensemble():
         self._input_dim = 0  # set below
         self._target_dim = 0 # set below
         self._nets = []
-        self._props = [] # f(input_tbi, time_t, id_idx_tb) -> output_tbi
+        self._props = [] # fwd propagators
 
         for workspace in workspaces:
             self._nets.append(Net(options, None, workspace))
@@ -63,7 +73,7 @@ class Ensemble():
         """
         Rewind to t = 0
         """
-        self._time_t = np.zeros(1).astype('int32')
+        self._time_tb = np.zeros((1, self._batch_size)).astype('float32')
     
     def run_one_step(self, vec_in):
         """
@@ -78,11 +88,10 @@ class Ensemble():
                          ((self._n_nets, self._batch_size, self._target_dim)) \
                          .astype('float32')
 
-        # input/output (3-dim), time (1-dim), id_idx (2-dim)
-        # regardless of step_size or batch_size
         for i, f in enumerate(self._props):
-            output_nbi[i] = f(input_nbi[i][None, :, :], self._time_t,
-                              self._id_idx_nb[i][None, :])[0]
+            # f(input_tbi, time_tb, id_idx_tb) -> [output_tbi]
+            output_nbi[i] = f(input_nbi[i][None, :, :], self._time_tb,
+                              self._id_idx_nb[i][None, :])[0] # _bi = _1bi 
 
-        self._time_t[0] += 1
+        self._time_tb[0] += 1.
         return output_nbi.reshape(-1)

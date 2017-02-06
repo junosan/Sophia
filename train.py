@@ -1,27 +1,48 @@
-#==========================================================================#
-# Copyright (C) 2016 Hosang Yoon (hosangy@gmail.com) - All Rights Reserved #
-# Unauthorized copying of this file, via any medium is strictly prohibited #
-#                       Proprietary and confidential                       #
-#==========================================================================#
+#   Copyright 2017 Hosang Yoon
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
 
 """
-Script for training
+Program for training
 
-Use as:
-    THEANO_FLAGS=floatX=float32,device=$DEV,gpuarray.preallocate=1 python -u \
-    train.py --data_dir=$DATA_DIR --save_to=$WORKSPACE_DIR/workspace_$NAME \
-    [--load_from=$WORKSPACE_DIR/workspace_$LOAD] \
-    | tee -a $WORKSPACE_DIR/$NAME".log"
-where $DEV=cuda0, etc (it is ok to set $NAME == $LOAD)
+Use as (for example):
+    DEV="device=cuda0"                      # single GPU
+    DEV="contexts=dev0->cuda0;dev1->cuda1"  # multi GPU
+    FLAGS="floatX=float32,"$DEV",gpuarray.preallocate=1,base_compiledir=theano"
+    THEANO_FLAGS=$FLAGS python -u train.py --data_dir=$DATA_DIR \
+        --save_to=$WORKSPACE_DIR/workspace_$NAME \
+        [--load_from=$WORKSPACE_DIR/workspace_$LOADNAME] [--seed=some_number] \
+        | tee -a $WORKSPACE_DIR/$NAME".log"
+
+- Device "cuda$" points to $-th GPU
+- Flag contexts can map any number of GPUs; this is parsed to figure out how
+  many GPUs are used for data parallelism
+- Flag gpuarray.preallocate reserves given ratio of GPU mem (reduce if needed)
+- Flag base_compiledir directs intermediate files to pwd/theano to avoid
+  lock conflicts between multiple training instances (by default ~/.theano)
+- $NAME == $LOADNAME is permitted
 """
 
-from __future__ import print_function # for end option in print()
+from __future__ import absolute_import, division, print_function
+from six import iterkeys, itervalues, iteritems
+
 from collections import OrderedDict
 import argparse
 from net import Net
-from data import build_id_idx, check_seq_len, DataIter
+from data import build_id_idx, DataIter
 import time
 import numpy as np
+import theano as th
 from subprocess import call
 import sys
 
@@ -30,18 +51,18 @@ def main():
 
     options['input_dim']          = 44
     options['target_dim']         = 1
-    options['unit_type']          = 'LSTM'     # FC/LSTM/GRU
+    options['unit_type']          = 'lstm'     # fc/lstm/gru
     options['lstm_peephole']      = True
+    options['loss_type']          = 'huber'    # l2/l1/huber
+    options['huber_delta']        = 0.33
     options['net_width']          = 512
     options['net_depth']          = 12
-    # options['layer_delays']       = '1;1;1;2;2;2;4;4;4;8;8;1'
     options['batch_size']         = 128
     options['window_size']        = 128
     options['step_size']          = 64
     options['init_scale']         = 0.02
     options['init_use_ortho']     = False
-    options['batch_norm']         = False
-    # options['batch_norm_decay']   = 0.9
+    options['weight_norm']        = False
     options['residual_gate']      = True
     options['learn_init_states']  = True
     options['learn_id_embedding'] = False
@@ -60,19 +81,25 @@ def main():
     options['max_retry']          = 10
     options['unroll_scan']        = False      # faster training/slower compile
 
+    if options['unroll_scan']:
+        sys.setrecursionlimit(32 * options['window_size']) # 32 is empirical
+
     # options['clock_t_exp_lo']     = 1.         # for learn_clock_params
     # options['clock_t_exp_hi']     = 6.         # for learn_clock_params
     # options['clock_r_on']         = 0.2        # for learn_clock_params
     # options['clock_leak_rate']    = 0.001      # for learn_clock_params
     # options['grad_norm_clip']     = 2.         # comment out to turn off
 
-    if options['unroll_scan']:
-        sys.setrecursionlimit(32 * options['window_size']) # 32 is empirical
+
+    """
+    Parse arguments, list files, and THEANO_FLAG settings
+    """
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_dir' , type = str, required = True)
     parser.add_argument('--save_to'  , type = str, required = True)
-    parser.add_argument('--load_from', type = str)    
+    parser.add_argument('--load_from', type = str)
+    parser.add_argument('--seed'     , type = int)
     args = parser.parse_args()
 
     assert 0 == call(str('mkdir -p ' + args.save_to).split())
@@ -83,6 +110,32 @@ def main():
     assert 0 == call(str('cp ' + args.data_dir + '/whitening.matrix '
                          + args.save_to).split())
 
+    # store ID count, internal ID order, and number of sequences
+    id_idx = build_id_idx(args.data_dir + '/train.list')
+    options['id_count'] = len(id_idx)
+    with open(args.save_to + '/ids.order', 'w') as f:
+        f.write(';'.join(iterkeys(id_idx))) # code_0;...;code_N-1
+
+    def n_seqs(list_file):
+        with open(list_file) as f:
+            return sum(1 for line in f)
+    
+    n_seqs_train = n_seqs(args.data_dir + '/train.list')
+    n_seqs_dev   = n_seqs(args.data_dir + '/dev.list')
+
+    # list of context_name's (THEANO_FLAGS=contexts=... for multi GPU mode)
+    c_names = [m.split('->')[0] for m in th.config.contexts.split(';')] \
+              if th.config.contexts != "" else None
+
+    # for replicating previous experiments
+    seed = np.random.randint(np.iinfo(np.int32).max) \
+           if args.seed is None else args.seed
+    np.random.seed(seed)
+
+
+    """
+    Print summary for logging 
+    """
 
     def print_hline(): print(''.join('-' for _ in range(79)))
     lapse_from = lambda start: ('(' + ('%.1f' % (time.time() - start)).rjust(7)
@@ -96,49 +149,28 @@ def main():
 
     print_hline() # -----------------------------------------------------------
     print('Options')
-    maxlen = max([len(v) for v in options.keys()])
-    for k, v in options.iteritems():
+    maxlen = max(len(k) for k in options.keys())
+    for k, v in iteritems(options):
         print('    ' + k.ljust(maxlen) + ' : ' + str(v))
-
+    
     print_hline() # -----------------------------------------------------------
     print('Stats')
-    seed = np.random.randint(np.iinfo(np.int32).max)
-    np.random.seed(seed)
-    print('    random seed     : ' + str(seed).rjust(10))
-
-    # store sequence length
-    print('    sequence length : ', end = '')
-    options['seq_len'] = check_seq_len(args.data_dir + '/train.list',
-                                       options['input_dim'],
-                                       options['target_dim'])
-    assert options['seq_len'] == check_seq_len(args.data_dir + '/dev.list',
-                                               options['input_dim'],
-                                               options['target_dim'])
-    print(str(options['seq_len']).rjust(10))
-
-    def n_seqs(list_file):
-        with open(list_file) as f:
-            return sum(1 for line in f)
-
-    print('    # of train seqs : '
-          + str(n_seqs(args.data_dir + '/train.list')).rjust(10))
-    print('    # of dev seqs   : '
-          + str(n_seqs(args.data_dir + '/dev.list')).rjust(10))
-
-    # store ID count & internal ID order
-    id_idx = build_id_idx(args.data_dir + '/train.list')
-    options['id_count'] = len(id_idx)
-    with open(args.save_to + '/ids.order', 'w') as f:
-        f.write(';'.join(id_idx.iterkeys())) # code_0;...;code_N-1
+    print('    np.random.seed  : ' + str(seed).rjust(10))
+    print('    # of train seqs : ' + str(n_seqs_train).rjust(10))
+    print('    # of dev seqs   : ' + str(n_seqs_dev  ).rjust(10))
     print('    # of unique IDs : ' + str(options['id_count']).rjust(10))
-
     print('    # of weights    : ', end = '')
-    net = Net(options, args.save_to, args.load_from)
+    net = Net(options, args.save_to, args.load_from, c_names) # takes few secs
     print(str(net.n_weights()).rjust(10))
 
+
+    """
+    Compile th.function's (time consuming) and prepare for training 
+    """
+
     print_hline() # -----------------------------------------------------------
-    print('Compiling fwd/bwd propagators... ', end = '')
-    start = time.time()
+    print('Compiling fwd/bwd propagators... ', end = '') # takes minutes ~ 
+    start = time.time()                                  # hours (unroll_scan)
     f_fwd_bwd_propagate = net.compile_f_fwd_bwd_propagate()
     f_fwd_propagate     = net.compile_f_fwd_propagate()
     print(lapse_from(start))
@@ -153,7 +185,6 @@ def main():
     train_data = DataIter(list_file   = args.data_dir + '/train.list',
                           window_size = options['window_size'],
                           step_size   = options['step_size'],
-                          seq_len     = options['seq_len'],
                           batch_size  = options['batch_size'],
                           input_dim   = options['input_dim'],
                           target_dim  = options['target_dim'],
@@ -161,7 +192,6 @@ def main():
     dev_data   = DataIter(list_file  = args.data_dir + '/dev.list',
                           window_size = options['window_size'],
                           step_size   = options['step_size'],
-                          seq_len     = options['seq_len'],
                           batch_size  = options['batch_size'],
                           input_dim   = options['input_dim'],
                           target_dim  = options['target_dim'],
@@ -192,13 +222,13 @@ def main():
         loss_sum = 0.
         frames_seen = 0
 
-        for input_tbi, target_tbi, time_t, id_idx_tb in data_iter:
+        for input_tbi, target_tbi, time_tb, id_idx_tb in data_iter:
             if is_training:
                 loss = f_fwd_bwd_propagate(input_tbi, target_tbi, 
-                                           time_t, id_idx_tb, step_size)
+                                           time_tb, id_idx_tb, step_size)
             else:
                 loss = f_fwd_propagate(input_tbi, target_tbi, 
-                                       time_t, id_idx_tb, step_size)
+                                       time_tb, id_idx_tb, step_size)
             
             loss_sum    += np.asscalar(loss[0])
             frames_seen += frames_per_step
@@ -221,10 +251,10 @@ def main():
     name_prev  = '1'
     name_best  = None # auto
 
-    total_trained_frames = 0
-    total_trained_frames_at_best = 0
-    total_trained_frames_at_pivot = 0
-    total_discarded_frames = 0
+    trained_frames = 0
+    trained_frames_at_pivot = 0
+    trained_frames_at_best = 0
+    discarded_frames = 0
 
     loss_pivot = 0.
     loss_prev  = 0.
@@ -232,11 +262,11 @@ def main():
 
     cur_retry = 0
 
-    net.save_to_workspace(name_prev)
-    net.save_to_workspace(name_best)
-
     lr = options['lr_init_val']
     f_initialize_optimizer()
+
+    net.save_to_workspace(name_prev)
+    net.save_to_workspace(name_best)
 
     while True:
         print_hline() # -------------------------------------------------------
@@ -245,35 +275,30 @@ def main():
         loss_train = run_epoch(train_data, lr)
         print(lapse_from(start))
 
-        total_trained_frames += trained_frames_per_epoch
+        trained_frames += trained_frames_per_epoch
 
         print('Evaluating... ', end = '')
         start = time.time()
         loss_cur = run_epoch(dev_data, None)
         print(lapse_from(start))
 
-        print('Total trained frames   : '
-              + str(total_trained_frames  ).rjust(12))
-        print('Total discarded frames : '
-              + str(total_discarded_frames).rjust(12))
-
+        print('Total trained frames   : ' + str(trained_frames  ).rjust(12))
+        print('Total discarded frames : ' + str(discarded_frames).rjust(12))
         print('Train loss : %.6f' % loss_train)
         print('Eval loss  : %.6f' % loss_cur, end = '')
 
         if np.isnan(loss_cur):
             loss_cur = np.float32('inf')
         
-        if total_trained_frames == trained_frames_per_epoch or \
-               loss_cur < loss_best:
+        if loss_cur < loss_best or trained_frames == trained_frames_per_epoch:
             print(' (best)', end = '')
 
+            trained_frames_at_best = trained_frames
             loss_best = loss_cur
-            total_trained_frames_at_best = total_trained_frames
             net.save_to_workspace(name_best)
         print('')
 
-        if total_trained_frames > trained_frames_per_epoch and \
-               loss_prev < loss_cur:
+        if loss_cur > loss_prev and trained_frames > trained_frames_per_epoch:
             print_hline() # ---------------------------------------------------
             
             cur_retry += 1
@@ -284,55 +309,50 @@ def main():
 
                 if lr < options['lr_lower_bound']:
                     break
-                
-                net.load_from_workspace(name_pivot)
-                net.save_to_workspace(name_prev)
 
-                discarded_frames \
-                    = total_trained_frames - total_trained_frames_at_pivot
-                
-                print('Discard recently trained '
-                      + str(discarded_frames) + ' frames')
-                print('New learning rate : ' + str(lr))
+                # cur <- pivot & prev <- cur
+                discard = trained_frames - trained_frames_at_pivot
+                discarded_frames += discard
+                trained_frames = trained_frames_at_pivot
+                net.load_from_workspace(name_pivot)
                 
                 f_initialize_optimizer()
 
-                total_discarded_frames += discarded_frames
-                total_trained_frames = total_trained_frames_at_pivot
                 loss_prev = loss_pivot
+                net.save_to_workspace(name_prev)
+
+                print('Discard recently trained ' + str(discard) + ' frames')
+                print('New learning rate : ' + str(lr))
+
             else:
-                print('Retry count : ' + str(cur_retry)
+                print('Retry count : ' + str(cur_retry) 
                       + ' / ' + str(options['max_retry']))
         else:
             cur_retry = 0
 
-            # prev goes to pivot & cur goes to prev
+            # pivot <- prev & prev <- cur
+            trained_frames_at_pivot = trained_frames - trained_frames_per_epoch
+
             loss_pivot, loss_prev = loss_prev, loss_cur
             name_pivot, name_prev = name_prev, name_pivot
 
             net.save_to_workspace(name_prev)
-
-            total_trained_frames_at_pivot \
-                = total_trained_frames - trained_frames_per_epoch
     
+
+    discarded_frames += trained_frames - trained_frames_at_best
+    trained_frames = trained_frames_at_best
     net.load_from_workspace(name_best)
+
     net.remove_from_workspace(name_pivot)
     net.remove_from_workspace(name_prev)
 
-    total_discarded_frames \
-        += total_trained_frames - total_trained_frames_at_best
-    total_trained_frames = total_trained_frames_at_best
-
     print('')
     print('Best network')
-    print('Total trained frames   : ' + str(total_trained_frames  ).rjust(12))
-    print('Total discarded frames : ' + str(total_discarded_frames).rjust(12))
-
-    loss_train = run_epoch(train_data, None)
-    print('[Train set] Loss : %.6f' % loss_train)
-    loss_dev = run_epoch(dev_data, None)
-    print('[ Dev set ] Loss : %.6f' % loss_dev)
+    print('Total trained frames   : ' + str(trained_frames  ).rjust(12))
+    print('Total discarded frames : ' + str(discarded_frames).rjust(12))
+    print('[Train set] Loss : %.6f' % run_epoch(train_data, None))
+    print('[ Dev set ] Loss : %.6f' % run_epoch(dev_data  , None))
     print('')
-    
+
 if __name__ == '__main__':
     main()

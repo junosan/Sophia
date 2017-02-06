@@ -1,24 +1,37 @@
-#==========================================================================#
-# Copyright (C) 2016 Hosang Yoon (hosangy@gmail.com) - All Rights Reserved #
-# Unauthorized copying of this file, via any medium is strictly prohibited #
-#                       Proprietary and confidential                       #
-#==========================================================================#
+#   Copyright 2017 Hosang Yoon
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
 
 """
 Optimizers
-    optim_f_inits, optim_f_updates, s_forces \
-        = force_func (options, s_lr    , v_grads )
-    optim_u_inits, optim_u_updates + param_updates \
-        = update_func(options, v_params, s_forces)
+- Implement the following signatures
+    $_force (options, ones, s_lr, v_grads, device) \
+        -> optim_f_inits, optim_f_updates, s_forces
+    $_update(options, ones, s_forces, device) \
+        -> optim_u_inits, optim_u_updates, s_increments
+  where ones is a list of np.ones_like(param) in the same order as v_params
+  (for obtaining shapes without eval()/get_value())
+- v_grads, s_forces, & s_increments are also lists of same shapes & order
 
-    to f_initialize_optimizer : optim_f_inits + optim_u_inits
-    to f_update_v_params      : optim_f_updates + optim_u_updates
-                                + param_updates
-Note:
-    v_params & v_grads must be lists of same shape & order
-    v_grads must be updated before applying updates returned here
-    Order between tuples in the updates list doesn't matter
+- To f_initialize_optimizer : optim_f_inits, optim_u_inits
+- To f_update_v_params      : optim_f_updates, optim_u_updates, s_increments
+
+- v_grads must be updated before applying updates returned here
+- Order between tuples in the updates list doesn't matter
+- Make th.SharedVariable's as th.shared(usual_stuff, **device)
 """
+
+from __future__ import absolute_import, division, print_function
 
 import numpy as np
 import theano as th
@@ -26,89 +39,83 @@ import theano.tensor as tt
 from utils import clip_elem
 
 """
-Update functions to define increment for parameters, treating gradient as a
+Update functions to define increments for parameters, treating gradient as a
 force along a potential hill with friction (unit mass & unit time step implied)
-    v += - (1 - mu) v + external_force
+    v += - (1 - mu) v + gradient_force
 where
     (1 - mu)      : dimensionless Stokes friction
-    external_force: e.g., (-lr * grad) for vanilla_force
-
-Implement the following signature:
-    f(options, v_params, s_forces) -> optim_u_inits, updates
-where updates includes both optim_u_updates + param_updates
+    gradient_force: e.g., (-lr * grad) for vanilla_force
 """
 
-def sgd_update(options, v_params, s_forces):
+def sgd_update(options, ones, s_forces, device):
     """
     Special case of momentum/nesterov with mu = 0
     (i.e., discrete version of critical damping)
-        x += external_force
+        x += gradient_force
     """
-    return [], [(v_param, v_param + s_force) \
-                for v_param, s_force in zip(v_params, s_forces)]
+    return [], [], s_forces
 
-def momentum_update(options, v_params, s_forces):
+def momentum_update(options, ones, s_forces, device):
     """
-    Naive update of momentum (velocity) with friction & external_force
-        v = mu v + external_force
+    Naive update of momentum (velocity) with friction & gradient_force
+        v = mu v + gradient_force
         x += v
     """
     mu = options['update_mu']
 
-    inits   = []
+    inits = []
     updates = []
+    s_increments = []
 
-    for v_param, s_force in zip(v_params, s_forces):
-        v_v = th.shared(np.zeros_like(v_param.get_value()))
+    for one, s_force in zip(ones, s_forces):
+        v_v = th.shared(0. * one, name = 'momentum_v', **device)
         inits.append((v_v, tt.zeros_like(v_v)))
 
         s_new_v = mu * v_v + s_force
 
-        updates.append((v_param, v_param + s_new_v))
         updates.append((v_v, s_new_v))
+        s_increments.append(s_new_v)
     
-    return inits, updates
+    return inits, updates, s_increments
 
-def nesterov_update(options, v_params, s_forces):
+def nesterov_update(options, ones, s_forces, device):
     """
-    Same as above, but with external_force at lookahead position
+    Same as above, but with gradient_force at lookahead position
     (in terms of peeked-ahead params; arXiv:1212.0901 Eqs 6,7)
         x -= mu v
-        v = mu v + external_force
+        v = mu v + gradient_force
         x += (1. + mu) v
     """
     mu = options['update_mu']
 
-    inits   = []
+    inits = []
     updates = []
+    s_increments = []
 
-    for v_param, s_force in zip(v_params, s_forces):
-        v_v = th.shared(np.zeros_like(v_param.get_value()))
+    for one, s_force in zip(ones, s_forces):
+        v_v = th.shared(0. * one, name = 'nesterov_v', **device)
         inits.append((v_v, tt.zeros_like(v_v)))
 
         s_new_v = mu * v_v + s_force
 
-        updates.append((v_param, v_param + (1. + mu) * s_new_v - mu * v_v))
         updates.append((v_v, s_new_v))
+        s_increments.append((1. + mu) * s_new_v - mu * v_v)
 
-    return inits, updates
+    return inits, updates, s_increments
 
 
 """
 Force functions to define increment for velocity
-(i.e., external_force excluding friction)
-
-Implement the following signature:
-    f(options, s_lr, v_grads) -> optim_f_inits, optim_f_updates, s_forces
+(i.e., gradient_force excluding friction)
 """
 
-def vanilla_force(options, s_lr, v_grads):
+def vanilla_force(options, ones, s_lr, v_grads, device):
     """
-    external_force = -lr * grad
+    gradient_force = -lr * grad
     """
     return [], [], [-s_lr * v_grad for v_grad in v_grads]
 
-def adadelta_force(options, s_lr, v_grads):
+def adadelta_force(options, ones, s_lr, v_grads, device):
     """
     Adapted with modifications from arXiv:1212.5701
     """
@@ -122,12 +129,12 @@ def adadelta_force(options, s_lr, v_grads):
     updates  = []
     s_forces = []
 
-    for v_grad in v_grads:
+    for one, v_grad in zip(ones, v_grads):
         # modded 0 init -> 1 init
-        v_grad_ms = th.shared(np.ones_like(v_grad.get_value()))
+        v_grad_ms = th.shared(1. * one, name = 'adadelta_grad_ms', **device)
         inits.append((v_grad_ms, tt.ones_like(v_grad_ms)))
         
-        v_force_ms = th.shared(np.zeros_like(v_grad.get_value()))
+        v_force_ms = th.shared(0. * one, name = 'adadelta_force_ms', **device)
         inits.append((v_force_ms, tt.zeros_like(v_force_ms)))
 
         s_new_grad_ms = rho * v_grad_ms + (1. - rho) * tt.sqr(v_grad)
@@ -144,7 +151,7 @@ def adadelta_force(options, s_lr, v_grads):
     
     return inits, updates, s_forces
 
-def rmsprop_force(options, s_lr, v_grads):
+def rmsprop_force(options, ones, s_lr, v_grads, device):
     """
     Adapted with modifications from
     http://www.cs.toronto.edu/~tijmen/csc321
@@ -160,9 +167,9 @@ def rmsprop_force(options, s_lr, v_grads):
     updates  = []
     s_forces = []
 
-    for v_grad in v_grads:
+    for one, v_grad in zip(ones, v_grads):
         # modded 0 init -> 1 init
-        v_grad_ms = th.shared(np.ones_like(v_grad.get_value()))
+        v_grad_ms = th.shared(1. * one, name = 'rmsprop_grad_ms', **device)
         inits.append((v_grad_ms, tt.ones_like(v_grad_ms)))
 
         s_new_grad_ms = rho * v_grad_ms + (1. - rho) * tt.sqr(v_grad)
@@ -174,7 +181,7 @@ def rmsprop_force(options, s_lr, v_grads):
     
     return inits, updates, s_forces
 
-def adam_force(options, s_lr, v_grads):
+def adam_force(options, ones, s_lr, v_grads, device):
     """
     Adapted from arXiv:1412.6980
     """
@@ -188,17 +195,17 @@ def adam_force(options, s_lr, v_grads):
     updates  = []
     s_forces = []
 
-    v_t = th.shared(np.float32(0.)) # scalar
+    v_t = th.shared(np.float32(0.), name = 'adam_t', **device) # scalar
     inits.append((v_t, tt.zeros_like(v_t)))
 
     s_new_t = v_t + 1.
     s_calibrated_lr = s_lr * tt.sqrt(1. - b2**(s_new_t)) / (1. - b1**(s_new_t))
 
-    for v_grad in v_grads:
-        v_m = th.shared(np.zeros_like(v_grad.get_value()))
+    for one, v_grad in zip(ones, v_grads):
+        v_m = th.shared(0. * one, name = 'adam_m', **device)
         inits.append((v_m, tt.zeros_like(v_m)))
         
-        v_v = th.shared(np.zeros_like(v_grad.get_value()))
+        v_v = th.shared(0. * one, name = 'adam_v', **device)
         inits.append((v_v, tt.zeros_like(v_v)))
 
         s_new_m = b1 * v_m + (1. - b1) * v_grad

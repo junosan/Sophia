@@ -1,12 +1,22 @@
-#==========================================================================#
-# Copyright (C) 2016 Hosang Yoon (hosangy@gmail.com) - All Rights Reserved #
-# Unauthorized copying of this file, via any medium is strictly prohibited #
-#                       Proprietary and confidential                       #
-#==========================================================================#
+#   Copyright 2017 Hosang Yoon
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
 
 """
-Script for real time inference via ZeroMQ IPC with an external agent
+Program for real-time inference via ZeroMQ IPC with an external process
 """
+
+from __future__ import absolute_import, division, print_function
 
 import zmq
 import numpy as np
@@ -17,7 +27,7 @@ def main():
     socket = context.socket(zmq.REP)
     socket.bind("ipc:///tmp/sophia_ipc")
 
-    # first msg:
+    # parse first msg:
     #     'workspace_0;...;workspace_(N-1);batch_size
     #      idx_0;...;idx_(B-1)  (for workspace 0)
     #      ...
@@ -44,8 +54,7 @@ def main():
             in : [n_nets][batch_size][input_dim ] (flattened to 1-dim)
             out: [n_nets][batch_size][target_dim] (flattened to 1-dim)
         """
-        msg = socket.recv()
-        inp = np.frombuffer(msg, dtype = '<f4')
+        inp = np.frombuffer(socket.recv(), dtype = '<f4')
 
         # signal end by sending one std::nanf("")
         if np.isnan(inp[0]):
