@@ -33,17 +33,17 @@ def l2_loss(s_output_tbi, s_target_tbi):
 
 def l1_loss(s_output_tbi, s_target_tbi):
     # D_err[loss] = sgn(err)
-    return tt.sum(tt.abs(s_output_tbi - s_target_tbi))
+    return tt.sum(tt.abs_(s_output_tbi - s_target_tbi))
 
 def huber_loss(s_output_tbi, s_target_tbi, delta):
     # D_err[loss] = clip_elem(err, delta)
     assert delta > 0.
-    a = tt.abs(s_output_tbi - s_target_tbi)
+    a = tt.abs_(s_output_tbi - s_target_tbi)
     return tt.sum(tt.switch(a <= delta, tt.sqr(a) / 2.,
                                         delta * (a - delta / 2.)))
 
 
-# Weight initializers
+# Weight initializations
 # Needs modification if used for ReLU or leaky ReLU nonlinearities:
 #     http://lasagne.readthedocs.io/en/latest/modules/init.html
 
@@ -89,7 +89,7 @@ def xavier_weight(n_in, n_out):
     return W.astype('float32')
 
 
-# Weight clipping
+# Gradient clipping
 
 def clip_norm(s_tensor, threshold):
     """

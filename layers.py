@@ -31,8 +31,18 @@ def cut0(x, n, stride):
 def cut1(x, n, stride):
     return x[:, n * stride : (n + 1) * stride] # assumes x.ndim > 1
 
-def weight_norm(W_jk, g_k): # weight normalization
+def weight_norm(W_jk, g_k):
     return g_k * W_jk / W_jk.norm(2, axis = 0, keepdims = True)
+
+def layer_norm(x_bi, s_i, b_i):
+    y_bi = (x_bi - x_bi.mean(1)[:, None]) / tt.sqrt(x_bi.var(1)[:, None] 
+                                                    + 1e-5)
+    return s_i[None, :] * y_bi + b_i[None, :]
+
+def ln_lambda(s_k, b_k, n, stride):
+    return (lambda x_bi,
+                   s_i = cut0(s_k, n, stride),
+                   b_i = cut0(b_k, n, stride): layer_norm(x_bi, s_i, b_i))
 
 class Layer(with_metaclass(ABCMeta)):
     def __init__(self, name):
@@ -163,6 +173,7 @@ class LSTMLayer(Layer):
         self.n_out           = n_out
         self.use_peephole    = options['lstm_peephole']
         self.use_weight_norm = options['weight_norm']
+        self.use_layer_norm  = options['layer_norm']
         self.use_clock       = options['learn_clock_params']
         self.use_res_gate    = options['residual_gate'] and n_in == n_out
         self.unroll_scan     = options['unroll_scan']
@@ -185,6 +196,10 @@ class LSTMLayer(Layer):
                     * np.sqrt(n_in ) * np.ones(4 * n_out).astype('float32'))
             params[self.pfx('wn_Ug')] = (np.euler_gamma * options['init_scale']
                     * np.sqrt(n_out) * np.ones(4 * n_out).astype('float32'))
+        
+        if self.use_layer_norm:
+            params[self.pfx('ln_s')] = np.ones (9 * n_out).astype('float32')
+            params[self.pfx('ln_b')] = np.zeros(9 * n_out).astype('float32')
 
         if self.use_clock:
             self.add_clock_params(params, n_out, options)
@@ -213,6 +228,14 @@ class LSTMLayer(Layer):
                    tt.zeros(3 * n_out).astype('float32')
         non_seqs = [init_h_i, init_c_i, U_i4i, p_3i]
         
+        if not self.use_layer_norm:
+            n = [lambda x_bi: x_bi] * 3
+        else:
+            n = [ln_lambda(v_param('ln_s'), v_param('ln_b'), 0, 4 * n_out),
+                 ln_lambda(v_param('ln_s'), v_param('ln_b'), 1, 4 * n_out),
+                 ln_lambda(v_param('ln_s'), v_param('ln_b'), 8, 1 * n_out)]
+            non_seqs.extend([v_param('ln_s'), v_param('ln_b')])
+
         mask_tbi = self.setup_clock_graph \
                        (s_time_tb, v_param('clk_t'), v_param('clk_s')) \
                    if self.use_clock else \
@@ -222,7 +245,7 @@ class LSTMLayer(Layer):
             prev_h_bi = tt.switch(time_b[:, None] > 0., prev_h_bi, init_h_i)
             prev_c_bi = tt.switch(time_b[:, None] > 0., prev_c_bi, init_c_i)
             
-            preact_b4i = x_b4i + tt.dot(prev_h_bi, U_i4i)
+            preact_b4i = n[0](x_b4i) + n[1](tt.dot(prev_h_bi, U_i4i))
 
             i_bi = tt.nnet.sigmoid(cut1(preact_b4i, 0, n_out)
                                  + cut0(p_3i, 0, n_out) * prev_c_bi)
@@ -237,7 +260,7 @@ class LSTMLayer(Layer):
             o_bi = tt.nnet.sigmoid(cut1(preact_b4i, 3, n_out)
                                  + cut0(p_3i, 2, n_out) * c_bi)
             
-            h_bi = o_bi * tt.tanh(c_bi)
+            h_bi = o_bi * tt.tanh(n[2](c_bi))
             if self.use_clock:
                 h_bi = mask_bi * h_bi + (1. - mask_bi) * prev_h_bi 
 
@@ -279,6 +302,7 @@ class GRULayer(Layer):
         self.n_steps         = options['window_size']
         self.n_out           = n_out
         self.use_weight_norm = options['weight_norm']
+        self.use_layer_norm  = options['layer_norm']
         self.use_clock       = options['learn_clock_params']
         self.use_res_gate    = options['residual_gate'] and n_in == n_out
         self.unroll_scan     = options['unroll_scan']
@@ -299,6 +323,10 @@ class GRULayer(Layer):
             params[self.pfx('wn_Ug')] = (np.euler_gamma * options['init_scale']
                     * np.sqrt(n_out) * np.ones(3 * n_out).astype('float32'))
         
+        if self.use_layer_norm:
+            params[self.pfx('ln_s')] = np.ones (6 * n_out).astype('float32')
+            params[self.pfx('ln_b')] = np.zeros(6 * n_out).astype('float32')
+
         if self.use_clock:
             self.add_clock_params(params, n_out, options)
 
@@ -322,6 +350,15 @@ class GRULayer(Layer):
                    if self.use_weight_norm else v_param('U')
         non_seqs = [init_h_i, U_i3i]
 
+        if not self.use_layer_norm:
+            n = [lambda x_bi: x_bi] * 4
+        else:
+            n = [ln_lambda(v_param('ln_s'), v_param('ln_b'), 0, 2 * n_out),
+                 ln_lambda(v_param('ln_s'), v_param('ln_b'), 1, 2 * n_out),
+                 ln_lambda(v_param('ln_s'), v_param('ln_b'), 4, 1 * n_out),
+                 ln_lambda(v_param('ln_s'), v_param('ln_b'), 5, 1 * n_out)]
+            non_seqs.extend([v_param('ln_s'), v_param('ln_b')])
+
         mask_tbi = self.setup_clock_graph \
                        (s_time_tb, v_param('clk_t'), v_param('clk_s')) \
                    if self.use_clock else \
@@ -330,14 +367,14 @@ class GRULayer(Layer):
         def step(x_b3i, time_b, mask_bi, prev_h_bi, *args):
             prev_h_bi = tt.switch(time_b[:, None] > 0., prev_h_bi, init_h_i)
             
-            preact_b2i = (cut1(x_b3i, 0, 2 * n_out)
-                        + tt.dot(prev_h_bi, cut1(U_i3i, 0, 2 * n_out)))
+            preact_b2i = (n[0](cut1(x_b3i, 0, 2 * n_out))
+                        + n[1](tt.dot(prev_h_bi, cut1(U_i3i, 0, 2 * n_out))))
 
             r_bi = tt.nnet.sigmoid(cut1(preact_b2i, 0, n_out))
             u_bi = tt.nnet.sigmoid(cut1(preact_b2i, 1, n_out))
 
-            c_bi = tt.tanh(cut1(x_b3i, 2, 1 * n_out)
-                         + r_bi * tt.dot(prev_h_bi, cut1(U_i3i, 2, 1 * n_out)))
+            c_bi = tt.tanh(n[2](cut1(x_b3i, 2, 1 * n_out))
+                   + r_bi * n[3](tt.dot(prev_h_bi, cut1(U_i3i, 2, 1 * n_out))))
 
             h_bi = (1. - u_bi) * prev_h_bi + u_bi * c_bi
             if self.use_clock:
@@ -350,7 +387,7 @@ class GRULayer(Layer):
                                sequences     = [x_tb3i, s_time_tb, mask_tbi],
                                outputs_info  = v_prev_state_bk,
                                non_sequences = non_seqs,
-                               n_steps       = n_steps,
+                               n_steps       = self.n_steps,
                                name          = self.pfx('scan'),
                                strict        = True)
         else:

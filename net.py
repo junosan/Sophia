@@ -14,7 +14,6 @@
 
 """
 Class for setting up graphs and compiling updater functions
-See README.md for a summary of this class
 """
 
 from __future__ import absolute_import, division, print_function

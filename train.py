@@ -17,16 +17,17 @@ Program for training
 
 Use as (for example):
     DEV="device=cuda0"                      # single GPU
-    DEV="contexts=dev0->cuda0;dev1->cuda1"  # multi GPU
+    DEV="contexts=dev0->cuda0;dev1->cuda1"  # multi GPU (currently incomplete)
     FLAGS="floatX=float32,"$DEV",gpuarray.preallocate=1,base_compiledir=theano"
     THEANO_FLAGS=$FLAGS python -u train.py --data_dir=$DATA_DIR \
         --save_to=$WORKSPACE_DIR/workspace_$NAME \
         [--load_from=$WORKSPACE_DIR/workspace_$LOADNAME] [--seed=some_number] \
         | tee -a $WORKSPACE_DIR/$NAME".log"
 
-- Device "cuda$" points to $-th GPU
-- Flag contexts can map any number of GPUs; this is parsed to figure out how
-  many GPUs are used for data parallelism
+- Device "cuda$" means $-th GPU
+- Flag contexts can map any number of GPUs to be used for data parallelism
+  (this feature is incomplete until Theano completes implementation 
+   of support for this flag)
 - Flag gpuarray.preallocate reserves given ratio of GPU mem (reduce if needed)
 - Flag base_compiledir directs intermediate files to pwd/theano to avoid
   lock conflicts between multiple training instances (by default ~/.theano)
@@ -53,8 +54,8 @@ def main():
     options['target_dim']         = 1
     options['unit_type']          = 'lstm'     # fc/lstm/gru
     options['lstm_peephole']      = True
-    options['loss_type']          = 'huber'    # l2/l1/huber
-    options['huber_delta']        = 0.33
+    options['loss_type']          = 'l2'       # l2/l1/huber
+    # options['huber_delta']        = 0.33       # depends on target's scale
     options['net_width']          = 512
     options['net_depth']          = 12
     options['batch_size']         = 128
@@ -63,11 +64,17 @@ def main():
     options['init_scale']         = 0.02
     options['init_use_ortho']     = False
     options['weight_norm']        = False
+    options['layer_norm']         = False
     options['residual_gate']      = True
     options['learn_init_states']  = True
     options['learn_id_embedding'] = False
     # options['id_embedding_dim']   = 16
     options['learn_clock_params'] = False
+    # options['clock_t_exp_lo']     = 1.         # for learn_clock_params
+    # options['clock_t_exp_hi']     = 6.         # for learn_clock_params
+    # options['clock_r_on']         = 0.2        # for learn_clock_params
+    # options['clock_leak_rate']    = 0.001      # for learn_clock_params
+    # options['grad_norm_clip']     = 2.         # comment out to turn off
     options['update_type']        = 'nesterov' # sgd/momentum/nesterov
     options['update_mu']          = 0.9        # for momentum/nesterov
     options['force_type']         = 'adadelta' # vanilla/adadelta/rmsprop/adam
@@ -84,13 +91,7 @@ def main():
     if options['unroll_scan']:
         sys.setrecursionlimit(32 * options['window_size']) # 32 is empirical
 
-    # options['clock_t_exp_lo']     = 1.         # for learn_clock_params
-    # options['clock_t_exp_hi']     = 6.         # for learn_clock_params
-    # options['clock_r_on']         = 0.2        # for learn_clock_params
-    # options['clock_leak_rate']    = 0.001      # for learn_clock_params
-    # options['grad_norm_clip']     = 2.         # comment out to turn off
-
-
+    
     """
     Parse arguments, list files, and THEANO_FLAG settings
     """

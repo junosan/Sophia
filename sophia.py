@@ -13,7 +13,7 @@
 #   limitations under the License.
 
 """
-Program for real-time inference via ZeroMQ IPC with an external process
+Program for real-time inference via ZeroMQ IPC/TCP with an external process
 """
 
 from __future__ import absolute_import, division, print_function
@@ -25,6 +25,8 @@ from ensemble import Ensemble
 def main():
     context = zmq.Context()
     socket = context.socket(zmq.REP)
+    
+    # using IPC here, but also supports TCP if communicating over a network
     socket.bind("ipc:///tmp/sophia_ipc")
 
     # parse first msg:
@@ -32,6 +34,11 @@ def main():
     #      idx_0;...;idx_(B-1)  (for workspace 0)
     #      ...
     #      idx_0;...;idx_(B-1)' (for workspace N-1)
+    # which declares paths for N models and batch_size (B) number of streams
+    #
+    # idx_i for stream i is the 0-based index of ID corresponding to stream i
+    # in ids.order (saved during training); idx_i can be set
+    # to an arbitrary number if not using options['learn_id_embedding']
     lines = str(socket.recv()).splitlines()
     assert len(lines) > 0
 
@@ -39,7 +46,7 @@ def main():
     batch_size = int(lines[0][lines[0].rfind(';') + 1 :])
     assert len(lines) == len(workspaces) + 1
 
-    indices = []
+    indices = [] # list of lists
     for line in lines[1 :]:
         indice = [int(idx) for idx in line.split(';')]
         assert len(indice) == batch_size
