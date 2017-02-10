@@ -16,8 +16,7 @@
 Program for training
 
 Use as (for example):
-    DEV="device=cuda0"                      # single GPU
-    DEV="contexts=dev0->cuda0;dev1->cuda1"  # multi GPU (currently incomplete)
+    DEV="device=cuda0"
     FLAGS="floatX=float32,"$DEV",gpuarray.preallocate=1,base_compiledir=theano"
     THEANO_FLAGS=$FLAGS python -u train.py --data_dir=$DATA_DIR \
         --save_to=$WORKSPACE_DIR/workspace_$NAME \
@@ -25,9 +24,6 @@ Use as (for example):
         | tee -a $WORKSPACE_DIR/$NAME".log"
 
 - Device "cuda$" means $-th GPU
-- Flag contexts can map any number of GPUs to be used for data parallelism
-  (this feature is incomplete until Theano completes implementation 
-   of support for this flag)
 - Flag gpuarray.preallocate reserves given ratio of GPU mem (reduce if needed)
 - Flag base_compiledir directs intermediate files to pwd/theano to avoid
   lock conflicts between multiple training instances (by default ~/.theano)
@@ -40,10 +36,9 @@ from six import iterkeys, itervalues, iteritems
 from collections import OrderedDict
 import argparse
 from net import Net
-from data import build_id_idx, DataIter
+from data import build_id_idx, check_seq_len, DataIter
 import time
 import numpy as np
-import theano as th
 from subprocess import call
 import sys
 
@@ -64,7 +59,8 @@ def main():
     options['init_scale']         = 0.02
     options['init_use_ortho']     = False
     options['weight_norm']        = False
-    options['layer_norm']         = False
+    options['batch_norm']         = True
+    options['batch_norm_decay']   = 0.9
     options['residual_gate']      = True
     options['learn_init_states']  = True
     options['learn_id_embedding'] = False
@@ -111,22 +107,26 @@ def main():
     assert 0 == call(str('cp ' + args.data_dir + '/whitening.matrix '
                          + args.save_to).split())
 
-    # store ID count, internal ID order, and number of sequences
+    # store sequence length, ID count, and internal ID order
+    options['seq_len'] = check_seq_len(args.data_dir + '/train.list',
+                                       options['input_dim'],
+                                       options['target_dim'])
+    assert options['seq_len'] == check_seq_len(args.data_dir + '/dev.list',
+                                               options['input_dim'],
+                                               options['target_dim'])
+    
     id_idx = build_id_idx(args.data_dir + '/train.list')
     options['id_count'] = len(id_idx)
     with open(args.save_to + '/ids.order', 'w') as f:
         f.write(';'.join(iterkeys(id_idx))) # code_0;...;code_N-1
 
+    # count sequences
     def n_seqs(list_file):
         with open(list_file) as f:
             return sum(1 for line in f)
     
     n_seqs_train = n_seqs(args.data_dir + '/train.list')
     n_seqs_dev   = n_seqs(args.data_dir + '/dev.list')
-
-    # list of context_name's (THEANO_FLAGS=contexts=... for multi GPU mode)
-    c_names = [m.split('->')[0] for m in th.config.contexts.split(';')] \
-              if th.config.contexts != "" else None
 
     # for replicating previous experiments
     seed = np.random.randint(np.iinfo(np.int32).max) \
@@ -157,11 +157,12 @@ def main():
     print_hline() # -----------------------------------------------------------
     print('Stats')
     print('    np.random.seed  : ' + str(seed).rjust(10))
+    print('    length of seqs  : ' + str(options['seq_len']).rjust(10))
     print('    # of train seqs : ' + str(n_seqs_train).rjust(10))
     print('    # of dev seqs   : ' + str(n_seqs_dev  ).rjust(10))
     print('    # of unique IDs : ' + str(options['id_count']).rjust(10))
     print('    # of weights    : ', end = '')
-    net = Net(options, args.save_to, args.load_from, c_names) # takes few secs
+    net = Net(options, args.save_to, args.load_from) # takes few secs
     print(str(net.n_weights()).rjust(10))
 
 
@@ -186,6 +187,7 @@ def main():
     train_data = DataIter(list_file   = args.data_dir + '/train.list',
                           window_size = options['window_size'],
                           step_size   = options['step_size'],
+                          seq_len     = options['seq_len'],
                           batch_size  = options['batch_size'],
                           input_dim   = options['input_dim'],
                           target_dim  = options['target_dim'],
@@ -193,6 +195,7 @@ def main():
     dev_data   = DataIter(list_file  = args.data_dir + '/dev.list',
                           window_size = options['window_size'],
                           step_size   = options['step_size'],
+                          seq_len     = options['seq_len'],
                           batch_size  = options['batch_size'],
                           input_dim   = options['input_dim'],
                           target_dim  = options['target_dim'],
@@ -223,13 +226,13 @@ def main():
         loss_sum = 0.
         frames_seen = 0
 
-        for input_tbi, target_tbi, time_tb, id_idx_tb in data_iter:
+        for input_tbi, target_tbi, time_t, id_idx_tb in data_iter:
             if is_training:
                 loss = f_fwd_bwd_propagate(input_tbi, target_tbi, 
-                                           time_tb, id_idx_tb, step_size)
+                                           time_t, id_idx_tb, step_size)
             else:
                 loss = f_fwd_propagate(input_tbi, target_tbi, 
-                                       time_tb, id_idx_tb, step_size)
+                                       time_t, id_idx_tb, step_size)
             
             loss_sum    += np.asscalar(loss[0])
             frames_seen += frames_per_step

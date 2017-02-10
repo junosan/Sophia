@@ -32,52 +32,13 @@ import numpy as np
 import theano as th
 import theano.tensor as tt
 
-class Slice():
-    def __init__(self, start, stop, context_name = None):
-        """
-        Batch-dimension slice of the full net, with parameters and states of
-        each slice residing in a separate device (GPU) mapped by the given
-        context_name
-            start, stop     int or NoneType [start, stop) batch index
-            [context_name]  str             use str as target for th.shared
-                            NoneType        use device set in THEANO_FLAGS
-        - [None, None) is equivalent to [:]
-        - When there are multiple slices, slice list must be created with
-          [start, stop) indices back-to-back in increasing order
-        - Parameters of all slices are synchronized every update
-        - Make th.SharedVariable's as th.shared(usual_stuff, **s.device)
-        """
-        assert start is None or stop is None or stop > start
-        self._rng   = slice(start, stop)
-        self.device = { 'target' : context_name } \
-                      if context_name is not None else {}
-        self.v_params      = OrderedDict() # { 'str' : th.SharedVariable }
-        self.v_prev_states = OrderedDict() # { 'str' : th.SharedVariable }
-    
-    def transfer(self, s_in): # returns node transferred to this slice's device
-        return s_in.transfer(self.device['target']) \
-               if self.device != {} else s_in
-        # return s_in
-
-    def apply(self, s_full): # slice given node in batch (1-th) dimension
-        return self.transfer(s_full[:, self._rng])
-    
-    def get_size(self, full_size):
-        return ((full_size if self._rng.stop  is None else self._rng.stop )
-              - (0         if self._rng.start is None else self._rng.start))
-
-
 class Net():
-    def __init__(self, options,
-                       save_to = None, load_from = None, c_names = None):
+    def __init__(self, options, save_to = None, load_from = None):
         """
         Mode is determined by whether save_to is None or not
 
         (common)
             <options>   OrderedDict { 'option_name' : option_val }
-            [c_names]   list of str [context names for each GPU]
-                                    (multi GPU mode ; THEANO_FLAGS=contexts=$)
-                        NoneType    (single GPU mode; THEANO_FLAGS=device=$)
         (training)
             <save_to>   str         'workspace_dir'
             [load_from] str         'workspace_dir' (if re-annealing)
@@ -89,7 +50,7 @@ class Net():
         NOTE: For inference, options['step_size'] and options['batch_size']
               must be specified
         """
-        self._configure(options, save_to, load_from, c_names)
+        self._configure(options, save_to, load_from)
         self._init_params(load_from)
         self._init_shared_variables()
         if self._is_training:
@@ -97,7 +58,7 @@ class Net():
         else:
             self._setup_inference_graph()
     
-    def _configure(self, options, save_to, load_from, c_names):
+    def _configure(self, options, save_to, load_from):
         if save_to is not None:
             self._is_training = True
 
@@ -129,35 +90,26 @@ class Net():
             self._options['step_size']   = options['step_size']
             self._options['batch_size']  = options['batch_size']
         
-        if c_names is not None:
-            n = self._options['batch_size']
-            m = len(c_names)
-
-            # distribute batches in n // m chunks
-            # if n % m > 0, it is added to the last device
-            i = [(n // m) * k for k in range(m)] + [n]
-            self._slices = [Slice(*args) for args in zip(i, i[1 :], c_names)]
-        else:
-            self._slices = [Slice(None, None)]
-        
-        # this is where gradients and optimizer states are stored
-        self._device = self._slices[0].device
- 
     def _init_params(self, load_from):
         """
-        Instantiate layers and store their learnable parameters and state info
-        Load parameter values from file if applicable
+        Instantiate layers and store their learnable parameters
+        and non-learnable variables (to become th.SharedVariable's below)
+        Load values from file if applicable
         """
         self._params = OrderedDict()
-        self._prev_dims = OrderedDict() # not learnable
+        self._prev_states = OrderedDict() # not learnable
+        self._statistics  = OrderedDict() # not learnable
 
-        def add_states(layer, state_dim):
-            if state_dim <= 0:
-                return
-            self._prev_dims[layer.pfx('prev')] = state_dim
-            if self._options['learn_init_states']:
-                self._params[layer.pfx('init')] = np.zeros(state_dim) \
-                                                    .astype('float32')
+        def add_nonlearnables(layer, state_dim, stat_dim):
+            if state_dim > 0:
+                self._prev_states[layer.pfx('prev')] = np.zeros \
+                   ((self._options['batch_size'], state_dim)).astype('float32')
+                if self._options['learn_init_states']:
+                    self._params[layer.pfx('init')] = np.zeros(state_dim) \
+                                                        .astype('float32')
+            if stat_dim > 0:
+                self._statistics[layer.pfx('stat')] = np.zeros \
+                    ((self._options['seq_len'], 2, stat_dim)).astype('float32')
 
 
         # optional ID embedder
@@ -165,13 +117,13 @@ class Net():
             add = 0
         else:
             self._id_embedder = FCLayer(self._pfx + 'FC_id_embedder')
-            state_dim = self._id_embedder.add_param \
+            state_dim, stat_dim = self._id_embedder.add_param \
                 (params  = self._params,
                  n_in    = self._options['id_count'],
                  n_out   = self._options['id_embedding_dim'],
                  options = self._options,
                  act     = 'lambda x: x')
-            add_states(self._id_embedder, state_dim)
+            add_nonlearnables(self._id_embedder, state_dim, stat_dim)
             add = self._options['id_embedding_dim']
 
         # main recurrent layers
@@ -182,24 +134,23 @@ class Net():
         for i in range(D):
             self._layers.append(eval(unit + 'Layer') \
                                     (self._pfx + unit + '_' + str(i)))
-            state_dim = self._layers[i].add_param \
+            state_dim, stat_dim = self._layers[i].add_param \
                 (params  = self._params,
                  n_in    = add + (self._options['net_width'] if i > 0 else \
                                   self._options['input_dim']),
                  n_out   = self._options['net_width'],
                  options = self._options)
-            add_states(self._layers[i], state_dim)
+            add_nonlearnables(self._layers[i], state_dim, stat_dim)
         
         # final FCLayer for dimension compression
         self._layers.append(FCLayer(self._pfx + 'FC_output'))
-        state_dim = self._layers[D].add_param \
+        state_dim, stat_dim = self._layers[D].add_param \
                 (params  = self._params,
                  n_in    = add + self._options['net_width'],
                  n_out   = self._options['target_dim'],
                  options = self._options,
                  act     = 'lambda x: x')
-        add_states(self._layers[D], state_dim)
-        
+        add_nonlearnables(self._layers[D], state_dim, stat_dim)
 
         if load_from is not None:
             len_pfx = len(self._pfx)
@@ -207,49 +158,79 @@ class Net():
             params = np.load(load_from + '/params.npz') # NpzFile object
             for k in iterkeys(self._params):
                 self._params[k] = params[k[len_pfx :]] # no pfx in saved params
-
+            
+            if self._options['batch_norm']:
+                stats = np.load(load_from + '/statistics.npz')
+                for k in iterkeys(self._statistics):
+                    self._statistics[k] = stats[k[len_pfx :]]
+    
     def _init_shared_variables(self):
         """
         Initialize shared variables from np.ndarray objects for parameters,
-        prev_states, and gradients
+        prev_states, gradients, and statistics (if applicable)
         """
-        for s in self._slices:
-            dev = s.device['target'] + '_' if s.device != {} else ''
+        self._v_params = OrderedDict()
+        for k, v in iteritems(self._params):
+            self._v_params[k] = th.shared(v, name = k)
 
-            for k, v in iteritems(self._params):
-                s.v_params[k] = th.shared(v, name = dev + k, **s.device)
-
-            for k, d in iteritems(self._prev_dims):
-                v = np.zeros((s.get_size(self._options['batch_size']), d)) \
-                      .astype('float32')
-                s.v_prev_states[k] = th.shared(v, name = dev + k, **s.device)
-
+        self._v_prev_states = OrderedDict()
+        for k, v in iteritems(self._prev_states):
+            self._v_prev_states[k] = th.shared(v, name = k)
+        
         if self._is_training:
             self._v_grads = \
-                [th.shared(v * 0., name = k + '_grad', **self._device) \
+                [th.shared(v * 0., name = k + '_grad') \
                  for k, v in iteritems(self._params)]
+        
+        if self._options['batch_norm']:
+            self._v_statistics = OrderedDict()
+            for k, v in iteritems(self._statistics):
+                self._v_statistics[k] = th.shared(v, name = k)
 
-    def _setup_forward_graph(self, s_input_tbi, s_time_tb, s_id_idx_tb,
-                                   s_next_prev_idx, v_params, v_prev_states):
+    def _setup_forward_graph(self, s_input_tbi, s_time_t, s_id_idx_tb,
+                                   s_next_prev_idx, is_training = False):
         """
         Specify layer connections
-        Layers return their internal states for next time step as
+        - is_training is relavant only if options['batch_norm']
+        - Layers return their internal states for next time step as
             prev_state_update = (v_prev_state, state[s_next_prev_idx])
-        which are collected as a list and returned along with the last
-        layer's output
+          which are collected as a list and returned along with the last
+          layer's output
+        - If options['batch_norm'] and is_training, layers return minibatch
+          statistics 
+              s_stat_tsl    [relative time indices][2][l]
+          which are used to setup updates for exponential averaged statistics
         """
         def get_v_prev_state(layer):
-            if layer.pfx('prev') in v_prev_states:
-                return v_prev_states[layer.pfx('prev')]
+            if layer.pfx('prev') in self._v_prev_states:
+                return self._v_prev_states[layer.pfx('prev')]
             else:
                 return None
         
         def get_v_init_state(layer):
-            if layer.pfx('prev') in v_prev_states \
+            if layer.pfx('prev') in self._v_prev_states \
                     and self._options['learn_init_states']:
-                return v_params[layer.pfx('init')]
+                return self._v_params[layer.pfx('init')]
             else:
                 return None
+
+        def get_v_stat_Tsl(layer):
+            if self._options['batch_norm'] \
+                    and layer.pfx('stat') in self._v_statistics \
+                    and is_training == False:
+                return self._v_statistics[layer.pfx('stat')]
+            else:
+                return None
+
+        def setup_stat_update(layer, s_stat_tsl):
+            assert self._options['batch_norm'] and is_training == True
+            rho = self._options['batch_norm_decay']
+            v = self._v_statistics[layer.pfx('stat')]
+            new_v = tt.set_subtensor(v[s_time_t],
+                        tt.switch(tt.neq(tt.any(v[s_time_t]), 0.),
+                                  rho * v[s_time_t] + (1. - rho) * s_stat_tsl,
+                                  s_stat_tsl)) # jump start on first update
+            return (v, new_v)
 
         def to_one_hot(x_tb, n_class):
             # 2-dim -> 3-dim version of tt.extra_ops.to_one_hot
@@ -258,38 +239,46 @@ class Net():
             y = tt.set_subtensor(z[tt.arange(x.shape[0]), x], 1.)
             return tt.reshape(y, (x_tb.shape[0], x_tb.shape[1], n_class))
 
+        prev_state_updates = []
+        stat_updates = []
+
         if not self._options['learn_id_embedding']:
             cat = lambda s_below_tbj: s_below_tbj
         else:
-            s_id_emb_tbi, _ = self._id_embedder.setup_graph \
+            s_id_emb_tbi, _, stat = self._id_embedder.setup_graph \
                 (s_below_tbj     = to_one_hot \
                                       (s_id_idx_tb, self._options['id_count']),
-                 s_time_tb       = s_time_tb,
+                 s_time_t        = s_time_t,
                  s_next_prev_idx = s_next_prev_idx,
-                 v_params        = v_params,
+                 v_params        = self._v_params,
                  v_prev_state_bk = get_v_prev_state(self._id_embedder),
-                 v_init_state_k  = get_v_init_state(self._id_embedder))
+                 v_init_state_k  = get_v_init_state(self._id_embedder),
+                 v_stat_Tsl      = get_v_stat_Tsl  (self._id_embedder))
             cat = lambda s_below_tbj: tt.concatenate([s_below_tbj,
                                                       s_id_emb_tbi], axis = 2)
+            if stat is not None:
+                stat_updates += [setup_stat_update(self._id_embedder, stat)]
 
         D = self._options['net_depth']
         s_outputs = [None] * (D + 1)  # (RNN) * D + FC
         s_outputs.append(s_input_tbi) # put input at index -1
-        prev_state_updates = []
 
         # vertical stack: input -> layer[0] -> ... -> layer[D - 1] -> output
         for i in range(D + 1):
-            s_outputs[i], update = self._layers[i].setup_graph \
+            s_outputs[i], update, stat = self._layers[i].setup_graph \
                 (s_below_tbj     = cat(s_outputs[i - 1]),
-                 s_time_tb       = s_time_tb,
+                 s_time_t        = s_time_t,
                  s_next_prev_idx = s_next_prev_idx,
-                 v_params        = v_params,
+                 v_params        = self._v_params,
                  v_prev_state_bk = get_v_prev_state(self._layers[i]),
-                 v_init_state_k  = get_v_init_state(self._layers[i]))
+                 v_init_state_k  = get_v_init_state(self._layers[i]),
+                 v_stat_Tsl      = get_v_stat_Tsl  (self._layers[i]))
             if update is not None:
-                prev_state_updates.append(update)
+                prev_state_updates += [update]
+            if stat is not None:
+                stat_updates += [setup_stat_update(self._layers[i], stat)]
         
-        return s_outputs[D], prev_state_updates
+        return s_outputs[D], prev_state_updates, stat_updates
 
     def _setup_inference_graph(self):
         """
@@ -299,30 +288,19 @@ class Net():
             updates : prev_states
         """
         p_input_tbi = tt.ftensor3(name  = 'port_i_input')
-        p_time_tb   = tt.fmatrix (name  = 'port_i_time')
+        p_time_t    = tt.ivector (name  = 'port_i_time')
         p_id_idx_tb = tt.imatrix (name  = 'port_i_id_idx')
         
         # step_size is a compile time constant for inference
         s_next_prev_idx = tt.alloc(np.int32(self._options['step_size'] - 1))
 
-        outputs = []
-        self._prev_state_updates = []
+        p_output_tbi, self._prev_state_updates, _ = \
+            self._setup_forward_graph(s_input_tbi     = p_input_tbi,
+                                      s_time_t        = p_time_t,
+                                      s_id_idx_tb     = p_id_idx_tb,
+                                      s_next_prev_idx = s_next_prev_idx)
 
-        for s in self._slices:
-            s_output_tbi, prev_state_updates = self._setup_forward_graph \
-                (s_input_tbi     = s.apply(p_input_tbi),
-                 s_time_tb       = s.apply(p_time_tb),
-                 s_id_idx_tb     = s.apply(p_id_idx_tb),
-                 s_next_prev_idx = s.transfer(s_next_prev_idx),
-                 v_params        = s.v_params,
-                 v_prev_states   = s.v_prev_states)
-            outputs += [self.transfer(s_output_tbi)]
-            self._prev_state_updates += prev_state_updates
-
-        # merge outputs from all slices
-        p_output_tbi = tt.concatenate(outputs, axis = 1)
-
-        self._prop_i_ports   = [p_input_tbi, p_time_tb, p_id_idx_tb]
+        self._prop_i_ports   = [p_input_tbi, p_time_t, p_id_idx_tb]
         self._prop_o_ports   = [p_output_tbi]
 
     def _setup_loss_graph(self, s_output_tbi, s_target_tbi, s_step_size):
@@ -364,7 +342,7 @@ class Net():
         - Returns lists of
             optim_init   = (v_optim_state, s_init_optim_state)
             optim_update = (v_optim_state, s_new_optim_state)
-            s_increment    (to update s.v_param <- s.v_param + s_increment)
+            s_increment    (to update v_param <- v_param + s_increment)
         - Assumes that v_grads has been updated prior to applying updates here
         - NOTE: v_grads must be a list instead of OrderedDict
         """
@@ -379,15 +357,13 @@ class Net():
                                                     (options = self._options,
                                                      ones    = ones,
                                                      s_lr    = s_lr,
-                                                     v_grads = v_grads,
-                                                     device  = self._device)
+                                                     v_grads = v_grads)
 
         optim_u_inits, optim_u_updates, s_increments = \
             eval(self._options['update_type'] + '_update') \
                                                     (options  = self._options,
                                                      ones     = ones,
-                                                     s_forces = s_forces,
-                                                     device   = self._device)
+                                                     s_forces = s_forces)
         
         return (optim_f_inits + optim_u_inits,
                 optim_f_updates + optim_u_updates,
@@ -396,63 +372,64 @@ class Net():
     def _setup_training_graph(self):
         """
         Connect graphs together for training and store in/out ports & updates
-        (propagation)  inputs  : input, target, time, id_idx, step_size
-                       outputs : loss
-                       updates : prev_states[, grads]
-        (param update) inputs  : lr
-                       outputs : None
-                       updates : params
-        (optim init)   inputs  : None
-                       outputs : None
-                       updates : optimizer states
+        (propagation)   inputs  : input, target, time, id_idx, step_size
+                        outputs : loss
+                        updates : prev_states[, grads]
+        (bn validation) inputs  : input, target, time, id_idx, step_size
+                        outputs : loss_bnval
+                        updates : prev_states_bnval
+        (param update)  inputs  : lr
+                        outputs : None
+                        updates : params
+        (optim init)    inputs  : None
+                        outputs : None
+                        updates : optimizer states
         """
         p_input_tbi  = tt.ftensor3(name = 'i_port_input')
         p_target_tbi = tt.ftensor3(name = 'i_port_target')
-        p_time_tb    = tt.fmatrix (name = 'i_port_time')
+        p_time_t     = tt.ivector (name = 'i_port_time')
         p_id_idx_tb  = tt.imatrix (name = 'i_port_id_idx')
         p_step_size  = tt.iscalar (name = 'i_port_step_size')
         p_lr         = tt.fscalar (name = 'i_port_lr')
 
-        self._prev_state_updates = []
-        losses = [] # list of s_loss
-        gradss = [] # list of s_grads (i.e., list of list)
-
-        for s in self._slices:
-            s_step_size = s.transfer(p_step_size)
-            s_output_tbi, prev_state_updates = self._setup_forward_graph \
-                (s_input_tbi     = s.apply(p_input_tbi),
-                 s_time_tb       = s.apply(p_time_tb),
-                 s_id_idx_tb     = s.apply(p_id_idx_tb),
-                 s_next_prev_idx = s_step_size - 1,
-                 v_params        = s.v_params,
-                 v_prev_states   = s.v_prev_states)
-            self._prev_state_updates += prev_state_updates
-
-            s_loss = self._setup_loss_graph \
-                (s_output_tbi = s_output_tbi,
-                 s_target_tbi = s.apply(p_target_tbi),
-                 s_step_size  = s_step_size)
-            losses += [self.transfer(s_loss)]
-
-            s_grads = self._setup_grads_graph \
-                (s_loss = s_loss,
-                 v_wrt  = list(itervalues(s.v_params)))
-            gradss += [[self.transfer(s_grad) for s_grad in s_grads]]
+        s_output_tbi, self._prev_state_updates, self._stat_updates = \
+            self._setup_forward_graph(s_input_tbi     = p_input_tbi,
+                                      s_time_t        = p_time_t,
+                                      s_id_idx_tb     = p_id_idx_tb,
+                                      s_next_prev_idx = p_step_size - 1,
+                                      is_training     = True)
         
-        # sum losses and grads from all slices
-        p_loss = sum(losses)
-        s_new_grads = [sum(grad_tuple) for grad_tuple in zip(*gradss)]
-        self._grad_updates = [u for u in zip(self._v_grads, s_new_grads)]
+        p_loss = self._setup_loss_graph(s_output_tbi = s_output_tbi,
+                                        s_target_tbi = p_target_tbi,
+                                        s_step_size  = p_step_size)
+
+        s_grads = self._setup_grads_graph(s_loss = p_loss,
+                                    v_wrt  = list(itervalues(self._v_params)))
+        self._grad_updates = list(zip(self._v_grads, s_grads))
 
         self._optim_inits, self._optim_param_updates, s_increments = \
-            self._setup_optimizer_graph(s_lr    = self.transfer(p_lr),
+            self._setup_optimizer_graph(s_lr    = p_lr,
                                         v_grads = self._v_grads)
+        self._optim_param_updates += [(p, p + i) for p, i in \
+                                zip(itervalues(self._v_params), s_increments)]
+        
+        if self._options['batch_norm']:
+            # validation in batch_norm uses _v_statistics instead of
+            # live statistics, and hence needs a separate graph
+            s_output_tbi_bnval, self._prev_state_updates_bnval, _ = \
+                self._setup_forward_graph(s_input_tbi     = p_input_tbi,
+                                          s_time_t        = p_time_t,
+                                          s_id_idx_tb     = p_id_idx_tb,
+                                          s_next_prev_idx = p_step_size - 1,
+                                          is_training     = False)
 
-        for s in self._slices:
-            self._optim_param_updates += \
-                [(p, p + i) for p, i in zip(s.v_params.values(), s_increments)]
+            p_loss_bnval = self._setup_loss_graph \
+                                    (s_output_tbi = s_output_tbi_bnval,
+                                     s_target_tbi = p_target_tbi,
+                                     s_step_size  = p_step_size)
+            self._bnval_o_ports  = [p_loss_bnval]
 
-        self._prop_i_ports   = [p_input_tbi, p_target_tbi, p_time_tb,
+        self._prop_i_ports   = [p_input_tbi, p_target_tbi, p_time_t,
                                 p_id_idx_tb, p_step_size]
         self._prop_o_ports   = [p_loss]
         self._update_i_ports = [p_lr]
@@ -471,17 +448,24 @@ class Net():
         """
         on_unused_input = 'raise' if self._options['learn_id_embedding'] \
                                   else 'ignore'
-        return th.function(inputs  = self._prop_i_ports,
-                           outputs = self._prop_o_ports,
-                           updates = self._prev_state_updates,
-                           on_unused_input = on_unused_input)
+        bnval = self._is_training and self._options['batch_norm']
+        if not bnval:
+            return th.function(inputs  = self._prop_i_ports,
+                               outputs = self._prop_o_ports,
+                               updates = self._prev_state_updates,
+                               on_unused_input = on_unused_input)
+        else:
+            return th.function(inputs  = self._prop_i_ports,
+                               outputs = self._bnval_o_ports,
+                               updates = self._prev_state_updates_bnval,
+                               on_unused_input = on_unused_input)
 
     def compile_f_fwd_bwd_propagate(self):
         """
         Compile a callable object of signature
             f(input_tbi, target_tbi, time_tb, id_idx_tb, step_size) -> [loss]
         As a side effect, calling it updates
-            v_grads, v_prev_states
+            v_grads, v_prev_states, (only during batch_norm) v_statistics
         
         - Output is a list of np.ndarray (i.e., loss = np.asscalar(output[0]))
         - For validation (obtain loss only), call f_fwd_propagate instead
@@ -492,7 +476,8 @@ class Net():
         return th.function(inputs  = self._prop_i_ports,
                            outputs = self._prop_o_ports,
                            updates = (self._grad_updates
-                                      + self._prev_state_updates),
+                                      + self._prev_state_updates
+                                      + self._stat_updates),
                            on_unused_input = on_unused_input)
     
     def compile_f_update_v_params(self):
@@ -526,48 +511,53 @@ class Net():
 
     def save_to_workspace(self, name = None):
         """
-        Transfer parameters from GPU to file
+        Transfer parameters & statistics (if applicable) from GPU to files
         """
         assert self._is_training
         sfx = name if name is not None else ''
 
-        # v_params in all slices are in sync, so we just use 0-th
-        for k, v_param in iteritems(self._slices[0].v_params):
+        for k, v_param in iteritems(self._v_params):
             self._params[k] = v_param.get_value() # pull from GPU
 
         # There is also savez_compressed, but parameter data
         # doesn't offer much opportunities for compression
         np.savez(self._save_to + '/params' + sfx + '.npz', **self._params)
 
+        if self._options['batch_norm']:
+            for k, v_stat in iteritems(self._v_statistics):
+                self._statistics[k] = v_stat.get_value()
+
+            np.savez(self._save_to + '/statistics' + sfx + '.npz',
+                     **self._statistics)
+
     def load_from_workspace(self, name = None):
         """
-        Transfer parameters from file to GPU
+        Transfer parameters & statistics (if applicable) from files to GPU
         """
         assert self._is_training
         sfx = name if name is not None else ''
         
         # ret = NpzFile object
         params = np.load(self._save_to + '/params' + sfx + '.npz')
-        for s in self._slices:
-            for k, v_param in iteritems(s.v_params):
-                v_param.set_value(params[k]) # push to GPU
+        for k, v_param in iteritems(self._v_params):
+            v_param.set_value(params[k]) # push to GPU
+        
+        if self._options['batch_norm']:
+            statistics = np.load(self._save_to + '/statistics' + sfx + '.npz')
+            for k, v_stat in iteritems(self._v_statistics):
+                v_stat.set_value(statistics[k])
     
     def remove_from_workspace(self, name = None):
         """
-        Remove temporary file from the workspace
+        Remove temporary files from the workspace
         """
         assert self._is_training
         sfx = name if name is not None else ''
 
         os.remove(self._save_to + '/params' + sfx + '.npz')
-    
-    def transfer(self, s_in):
-        """
-        Return given node transferred to Net's device (same as 0-th Slice)
-        """
-        return s_in.transfer(self._device['target']) \
-               if self._device != {} else s_in
-        # return s_in
+
+        if self._options['batch_norm']:
+            os.remove(self._save_to + '/statistics' + sfx + '.npz')
 
     def dimensions(self):
         return self._options['input_dim'], self._options['target_dim']

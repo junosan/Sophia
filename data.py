@@ -23,24 +23,25 @@ Iterator class for time slices of shuffled sequence minibatches
 - For unroll_scan option to work in Net, window_size must be a compile time
   constant and hence cannot be changed once a Net is instantiated
 
-- Sequences are assumed to be of arbitrary lengths, each with their own clocks
+- Sequences are assumed to be all of same lengths as batch_norm requires
+  synchronized time (unless data is padded, which may not always be applicable)
 - Sequences are each given an id_idx to be used as an one-hot encoding index
   if an ID can be associated with a sequence (may be ignored if irrelevant)
 
 - Use as
-      for input_tbi, target_tbi, time_tb, id_idx_tb in data_iter:
+      for input_tbi, target_tbi, time_t, id_idx_tb in data_iter:
           (loop content)
   where return values are np.ndarray's of dimensions
       input     float32     [window_size][batch_size][input_dim ]
       target    float32     [window_size][batch_size][target_dim]
-      time      float32     [window_size][batch_size]
+      time      int32       [window_size]
       id_idx    int32       [window_size][batch_size]
   randomly shuffled in 1-th (batch) dimension
 - Call discard_unfinished to use new sequences next iteration
 - Unless stopped explicitly inside the loop, iterates indefinitely
 
-- Time starts at 0. and increases by 1. each time index
-- For recurrent layers with states, time <= 0. signals state reset
+- Time starts at 0 and increases by 1 each time index
+- For recurrent layers with states, time <= 0 signals state reset
 
 - Upon each iteration, 
     - Previous arrays are shifted by step_size to the left in time dimension
@@ -83,15 +84,35 @@ def read_ti(file_name, dim):
     return np.fromfile(file_name, dtype = '<f4') \
              .reshape((-1, dim)).astype('float32')
 
+def check_seq_len(list_file, input_dim, target_dim):
+    """
+    Check that all sequences are of equal length and return that length
+    DataIter class relies on this and does not check lengths inside
+    """
+    root = list_file[: list_file.rfind('/') + 1] # includes /
+    with open(list_file) as f:
+        for i, seq in enumerate(f):
+            seq = seq.strip()
+            input_len  = read_ti(root + seq + '.input' , input_dim ).shape[0]
+            target_len = read_ti(root + seq + '.target', target_dim).shape[0]
+            assert input_len == target_len
+            
+            if i == 0:
+                seq_len = input_len
+            else:
+                assert seq_len == input_len
+    return seq_len
+
 class DataIter(Iterator):
     def __iter__(self):
         return self
 
-    def __init__(self, list_file, window_size, step_size,
+    def __init__(self, list_file, window_size, step_size, seq_len,
                  batch_size, input_dim, target_dim, id_idx):
         self._data_root   = list_file[: list_file.rfind('/') + 1] # includes /
         self._window_size = window_size
         self.set_step_size(step_size)
+        self._seq_len     = seq_len
         self._batch_size  = batch_size
         self._input_dim   = input_dim
         self._target_dim  = target_dim
@@ -102,19 +123,19 @@ class DataIter(Iterator):
                              .astype('float32')
         self._target_tbi = np.zeros((window_size, batch_size, target_dim)) \
                              .astype('float32')
-        self._time_tb    = np.zeros((window_size, batch_size)) \
-                             .astype('float32')
+        self._time_t     = np.zeros(window_size) \
+                             .astype('int32')
         self._id_idx_tb  = np.zeros((window_size, batch_size)) \
                              .astype('int32')
         
         # buffers for currently open files
-        # new files are read when time index reaches input.shape[0]
-        self._t_idxs  = batch_size * [0] # time index cursors in files
-        self._id_idxs = batch_size * [0] # id_idx values
-        self._inputs  = batch_size * [np.zeros((0, input_dim )) \
-                                        .astype('float32')]
-        self._targets = batch_size * [np.zeros((0, target_dim)) \
-                                        .astype('float32')]
+        # new files are read when time index reaches seq_len
+        self._t_idx   = seq_len
+        self._inputs  = np.zeros((seq_len, batch_size, input_dim )) \
+                          .astype('float32')
+        self._targets = np.zeros((seq_len, batch_size, target_dim)) \
+                          .astype('float32')
+        self._id_idxs = np.zeros(batch_size).astype('int32')
 
         self._seqs = []
         with open(list_file) as f:
@@ -136,22 +157,20 @@ class DataIter(Iterator):
         self._seq_idx += 1
         return seq
 
-    def _read(self, batch_idx):
-        seq  = self._pop_seq()
-        data = self._data_root + seq
+    def _read_batch(self):
+        for b in range(self._batch_size):
+            seq = self._pop_seq()
+            dat = self._data_root + seq
 
-        self._t_idxs [batch_idx] = 0
-        self._id_idxs[batch_idx] = self._id_idx[seq_to_id(seq)]
+            self._inputs [:, b, :] = read_ti(dat + '.input' , self._input_dim )
+            self._targets[:, b, :] = read_ti(dat + '.target', self._target_dim)
+            self._id_idxs[b] = self._id_idx[seq_to_id(seq)]
 
-        self._inputs [batch_idx] = read_ti(data + '.input' , self._input_dim )
-        self._targets[batch_idx] = read_ti(data + '.target', self._target_dim)
-        assert self._inputs[batch_idx].shape[0] \
-               == self._targets[batch_idx].shape[0]
+        self._t_idx = 0
 
     def discard_unfinished(self):
-        for b in range(self._batch_size):
-            if self._t_idxs[b] > 0:
-                self._t_idxs[b] = self._inputs[b].shape[0]
+        if self._t_idx > 0:
+            self._t_idx = self._seq_len
 
     def set_step_size(self, step_size):
         assert self._window_size >= step_size
@@ -162,29 +181,27 @@ class DataIter(Iterator):
 
         shift(self._input_tbi , self._step_size)
         shift(self._target_tbi, self._step_size)
-        shift(self._time_tb   , self._step_size)
+        shift(self._time_t    , self._step_size)
         shift(self._id_idx_tb , self._step_size)
 
-        for b in range(self._batch_size):
-            cur = self._window_size - self._step_size
+        cur = self._window_size - self._step_size
 
-            while cur < self._window_size:
-                while self._t_idxs[b] >= self._inputs[b].shape[0]:
-                    self._read(b)
-                
-                inc = min(self._window_size - cur,
-                          self._inputs[b].shape[0] - self._t_idxs[b])
-                rng_b = range(cur, cur + inc)
-                rng_f = range(self._t_idxs[b], self._t_idxs[b] + inc)
+        while cur < self._window_size:
+            while self._t_idx >= self._seq_len:
+                self._read_batch()
+            
+            inc = min(self._window_size - cur, self._seq_len - self._t_idx)
+            rng_b = range(cur, cur + inc)
+            rng_f = range(self._t_idx, self._t_idx + inc)
 
-                self._input_tbi [rng_b, b, :] = self._inputs [b][rng_f, :]
-                self._target_tbi[rng_b, b, :] = self._targets[b][rng_f, :]
-                self._time_tb   [rng_b, b]    = np.array(rng_f) \
-                                                  .astype('float32')
-                self._id_idx_tb [rng_b, b]    = self._id_idxs[b]
+            self._time_t[rng_b] = np.array(rng_f).astype('int32')
 
-                cur += inc
-                self._t_idxs[b] += inc
+            self._input_tbi [rng_b, :, :] = self._inputs [rng_f, :, :]
+            self._target_tbi[rng_b, :, :] = self._targets[rng_f, :, :]
+            self._id_idx_tb [rng_b, :]    = self._id_idxs[None, :] # broadcast
+
+            cur += inc
+            self._t_idx += inc
         
         return self._input_tbi, self._target_tbi, \
-               self._time_tb, self._id_idx_tb
+               self._time_t, self._id_idx_tb

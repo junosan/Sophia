@@ -73,7 +73,7 @@ class Ensemble():
         """
         Rewind to t = 0
         """
-        self._time_tb = np.zeros((1, self._batch_size)).astype('float32')
+        self._time_t = np.zeros(1).astype('int32')
     
     def run_one_step(self, vec_in):
         """
@@ -89,9 +89,9 @@ class Ensemble():
                          .astype('float32')
 
         for i, f in enumerate(self._props):
-            # f(input_tbi, time_tb, id_idx_tb) -> [output_tbi]
-            output_nbi[i] = f(input_nbi[i][None, :, :], self._time_tb,
+            # f(input_tbi, time_t, id_idx_tb) -> [output_tbi]
+            output_nbi[i] = f(input_nbi[i][None, :, :], self._time_t,
                               self._id_idx_nb[i][None, :])[0] # _bi = _1bi 
 
-        self._time_tb[0] += 1.
+        self._time_t[0] += 1
         return output_nbi.reshape(-1)

@@ -15,9 +15,9 @@
 """
 Optimizers
 - Implement the following signatures
-    $_force (options, ones, s_lr, v_grads, device) \
+    $_force (options, ones, s_lr, v_grads) \
         -> optim_f_inits, optim_f_updates, s_forces
-    $_update(options, ones, s_forces, device) \
+    $_update(options, ones, s_forces) \
         -> optim_u_inits, optim_u_updates, s_increments
   where ones is a list of np.ones_like(param) in the same order as v_params
   (for obtaining shapes without eval()/get_value())
@@ -28,7 +28,6 @@ Optimizers
 
 - v_grads must be updated before applying updates returned here
 - Order between tuples in the updates list doesn't matter
-- Make th.SharedVariable's as th.shared(usual_stuff, **device)
 """
 
 from __future__ import absolute_import, division, print_function
@@ -47,7 +46,7 @@ where
     gradient_force: e.g., (-lr * grad) for vanilla_force
 """
 
-def sgd_update(options, ones, s_forces, device):
+def sgd_update(options, ones, s_forces):
     """
     Special case of momentum/nesterov with mu = 0
     (i.e., discrete version of critical damping)
@@ -55,7 +54,7 @@ def sgd_update(options, ones, s_forces, device):
     """
     return [], [], s_forces
 
-def momentum_update(options, ones, s_forces, device):
+def momentum_update(options, ones, s_forces):
     """
     Naive update of momentum (velocity) with friction & gradient_force
         v = mu v + gradient_force
@@ -68,7 +67,7 @@ def momentum_update(options, ones, s_forces, device):
     s_increments = []
 
     for one, s_force in zip(ones, s_forces):
-        v_v = th.shared(0. * one, name = 'momentum_v', **device)
+        v_v = th.shared(0. * one, name = 'momentum_v')
         inits.append((v_v, tt.zeros_like(v_v)))
 
         s_new_v = mu * v_v + s_force
@@ -78,7 +77,7 @@ def momentum_update(options, ones, s_forces, device):
     
     return inits, updates, s_increments
 
-def nesterov_update(options, ones, s_forces, device):
+def nesterov_update(options, ones, s_forces):
     """
     Same as above, but with gradient_force at lookahead position
     (in terms of peeked-ahead params; arXiv:1212.0901 Eqs 6,7)
@@ -93,7 +92,7 @@ def nesterov_update(options, ones, s_forces, device):
     s_increments = []
 
     for one, s_force in zip(ones, s_forces):
-        v_v = th.shared(0. * one, name = 'nesterov_v', **device)
+        v_v = th.shared(0. * one, name = 'nesterov_v')
         inits.append((v_v, tt.zeros_like(v_v)))
 
         s_new_v = mu * v_v + s_force
@@ -109,13 +108,13 @@ Force functions to define increment for velocity
 (i.e., gradient_force excluding friction)
 """
 
-def vanilla_force(options, ones, s_lr, v_grads, device):
+def vanilla_force(options, ones, s_lr, v_grads):
     """
     gradient_force = -lr * grad
     """
     return [], [], [-s_lr * v_grad for v_grad in v_grads]
 
-def adadelta_force(options, ones, s_lr, v_grads, device):
+def adadelta_force(options, ones, s_lr, v_grads):
     """
     Adapted with modifications from arXiv:1212.5701
     """
@@ -131,10 +130,10 @@ def adadelta_force(options, ones, s_lr, v_grads, device):
 
     for one, v_grad in zip(ones, v_grads):
         # modded 0 init -> 1 init
-        v_grad_ms = th.shared(1. * one, name = 'adadelta_grad_ms', **device)
+        v_grad_ms = th.shared(1. * one, name = 'adadelta_grad_ms')
         inits.append((v_grad_ms, tt.ones_like(v_grad_ms)))
         
-        v_force_ms = th.shared(0. * one, name = 'adadelta_force_ms', **device)
+        v_force_ms = th.shared(0. * one, name = 'adadelta_force_ms')
         inits.append((v_force_ms, tt.zeros_like(v_force_ms)))
 
         s_new_grad_ms = rho * v_grad_ms + (1. - rho) * tt.sqr(v_grad)
@@ -151,7 +150,7 @@ def adadelta_force(options, ones, s_lr, v_grads, device):
     
     return inits, updates, s_forces
 
-def rmsprop_force(options, ones, s_lr, v_grads, device):
+def rmsprop_force(options, ones, s_lr, v_grads):
     """
     Adapted with modifications from
     http://www.cs.toronto.edu/~tijmen/csc321
@@ -169,7 +168,7 @@ def rmsprop_force(options, ones, s_lr, v_grads, device):
 
     for one, v_grad in zip(ones, v_grads):
         # modded 0 init -> 1 init
-        v_grad_ms = th.shared(1. * one, name = 'rmsprop_grad_ms', **device)
+        v_grad_ms = th.shared(1. * one, name = 'rmsprop_grad_ms')
         inits.append((v_grad_ms, tt.ones_like(v_grad_ms)))
 
         s_new_grad_ms = rho * v_grad_ms + (1. - rho) * tt.sqr(v_grad)
@@ -181,7 +180,7 @@ def rmsprop_force(options, ones, s_lr, v_grads, device):
     
     return inits, updates, s_forces
 
-def adam_force(options, ones, s_lr, v_grads, device):
+def adam_force(options, ones, s_lr, v_grads):
     """
     Adapted from arXiv:1412.6980
     """
@@ -195,17 +194,17 @@ def adam_force(options, ones, s_lr, v_grads, device):
     updates  = []
     s_forces = []
 
-    v_t = th.shared(np.float32(0.), name = 'adam_t', **device) # scalar
+    v_t = th.shared(np.float32(0.), name = 'adam_t') # scalar
     inits.append((v_t, tt.zeros_like(v_t)))
 
     s_new_t = v_t + 1.
     s_calibrated_lr = s_lr * tt.sqrt(1. - b2**(s_new_t)) / (1. - b1**(s_new_t))
 
     for one, v_grad in zip(ones, v_grads):
-        v_m = th.shared(0. * one, name = 'adam_m', **device)
+        v_m = th.shared(0. * one, name = 'adam_m')
         inits.append((v_m, tt.zeros_like(v_m)))
         
-        v_v = th.shared(0. * one, name = 'adam_v', **device)
+        v_v = th.shared(0. * one, name = 'adam_v')
         inits.append((v_v, tt.zeros_like(v_v)))
 
         s_new_m = b1 * v_m + (1. - b1) * v_grad
