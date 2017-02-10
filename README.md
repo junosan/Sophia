@@ -46,9 +46,10 @@ a network (TCP).
 Project was developed on Ubuntu 16.04.1 LTS.
 Version numbers are not hard requirements.
 
-- Python 2.7 or 3.x (with six 1.10.0)
-- Theano (developed on 0.9.0.dev4-py2.7), along with its dependencies
-- ZeroMQ (developed on pyzmq 16.0.2)
+- Python 2.7 or 3.5+
+- Theano (0.9.0b1), along with its dependencies
+  (CUDA 8.0.44, cuDNN 5.1.5, libgpuarray 0.6.0)
+- ZeroMQ (pyzmq 16.0.2)
   : used for communicating real-time input/output data with an external process
 - Input and target data preprocessed and saved as separate binary files
   (see below for format)
@@ -90,12 +91,7 @@ Version numbers are not hard requirements.
 
 
 ## Training
-- Options are configured in `train.py`; see table below
-- Instructions for launching a training instance is provided in `train.py`
-  heading; multiple instances may be launched if needed
-- By providing a `--load_from` flag, the RNN can be trained starting from
-  an already trained RNN; this may help getting out of saddle points on
-  some tasks
+- Options are configured in `train.py`
 
 |     option name      |               explanation               |
 |:--------------------:|:---------------------------------------:|
@@ -115,6 +111,16 @@ Version numbers are not hard requirements.
 |   frames_per_epoch   |time_indices * batch_size per epoch      |
 |   lr_*, max_retry    |for learning rate annealing with patience|
 |     unroll_scan      |trades memory consumption & slower compile time for faster training|
+
+- Instructions for launching a training instance is provided in `train.py`
+  heading
+- Multiple instances may be launched if needed
+- By providing a `--load_from` flag, the RNN can be trained starting from
+  an already trained RNN; this may help getting out of saddle points on
+  some tasks
+- Sample `train.py` output:
+
+<img src="readme/train.png" width="561"/>
 
 
 ## Inference

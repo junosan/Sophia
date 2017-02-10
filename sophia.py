@@ -14,6 +14,10 @@
 
 """
 Program for real-time inference via ZeroMQ IPC/TCP with an external process
+
+- Use the same THEANO_FLAGS as in train.py
+- If unneeded, suppress device info output with an additional
+  'print_active_device=False' flag
 """
 
 from __future__ import absolute_import, division, print_function
